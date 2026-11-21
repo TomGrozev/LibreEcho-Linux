@@ -451,15 +451,18 @@ static int __maybe_unused mtk8250_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * No serial8250_do_pm(): autoconfig types every MediaTek UART as ST16650V2, so
+ * that helper would put the port into 16650 sleep mode (IER bit 4) on
+ * power-down. Data arriving in that state wedges the transmitter until the SoC
+ * is reset, so this applies to every SoC the driver supports, not one board.
+ */
 static void
 mtk8250_do_pm(struct uart_port *port, unsigned int state, unsigned int old)
 {
 	if (!state)
 		pm_runtime_get_sync(port->dev);
-
-	serial8250_do_pm(port, state, old);
-
-	if (state)
+	else
 		pm_runtime_put_sync_suspend(port->dev);
 }
 
