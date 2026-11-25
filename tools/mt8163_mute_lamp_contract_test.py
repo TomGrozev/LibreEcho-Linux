@@ -83,7 +83,7 @@ class MuteLampContractTests(unittest.TestCase):
         self.assertIn("ret = -EOPNOTSUPP;", store)
         show = body_of(self.driver, "static ssize_t mute_lamp_show(",
                        "\n}\n")
-        self.assertIn("if (priv->hw_latch)", show)
+        self.assertIn("if (priv->hw_latch || priv->state_input)", show)
         self.assertIn("-EOPNOTSUPP", show)
 
     def test_shutdown_mode_suppresses_and_restores_the_lamp(self) -> None:

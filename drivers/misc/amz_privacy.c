@@ -15,6 +15,7 @@
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
 #include <linux/input.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -29,9 +30,11 @@
 struct amz_privacy {
 	struct device *dev;
 	struct gpio_desc *privacy_gpio;
+	struct gpio_desc *privacy_state_gpio;
 	struct gpio_desc *bright_state_gpio;
 	struct gpio_desc *public_hw_state_gpio;
 	struct priv_cb_data *callbacks[PRIV_CB_MAX];
+	bool state_input;
 	bool disabled;
 	bool hw_latch;
 	bool input_handler_registered;
@@ -115,7 +118,8 @@ static int amz_privacy_assert_latch(struct amz_privacy *priv)
 	 * (raw low), then release the privacy trigger (raw low).
 	 */
 	while (retries--) {
-		value = gpiod_get_raw_value_cansleep(priv->public_hw_state_gpio);
+		value = gpiod_get_raw_value_cansleep(
+			priv->public_hw_state_gpio);
 		if (value < 0)
 			return value;
 		if (!value)
@@ -123,8 +127,9 @@ static int amz_privacy_assert_latch(struct amz_privacy *priv)
 		usleep_range(10000, 11000);
 	}
 	if (value)
-		return dev_err_probe(priv->dev, -ETIMEDOUT,
-				     "privacy latch acknowledgement timed out\n");
+		return dev_err_probe(
+			priv->dev, -ETIMEDOUT,
+			"privacy latch acknowledgement timed out\n");
 
 	gpiod_set_raw_value_cansleep(priv->privacy_gpio, 0);
 	return 0;
@@ -137,6 +142,8 @@ static int __amz_priv_trigger(struct amz_privacy *priv, int on)
 
 	if (priv->disabled)
 		return 0;
+	if (priv->state_input)
+		return -EOPNOTSUPP;
 
 	on &= 1;
 
@@ -280,20 +287,20 @@ static void amz_privacy_input_disconnect(struct input_handle *handle)
 static const struct input_device_id amz_privacy_ids[] = {
 	{
 		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
-				 INPUT_DEVICE_ID_MATCH_KEYBIT,
+			 INPUT_DEVICE_ID_MATCH_KEYBIT,
 		.evbit = { BIT_MASK(EV_KEY) },
 		.keybit = { [BIT_WORD(KEY_MUTE)] = BIT_MASK(KEY_MUTE) },
 	},
-	{ },
+	{},
 };
 MODULE_DEVICE_TABLE(input, amz_privacy_ids);
 
 static struct input_handler amz_privacy_input_handler = {
-	.event		= amz_privacy_input_event,
-	.connect	= amz_privacy_input_connect,
-	.disconnect	= amz_privacy_input_disconnect,
-	.name		= "amz_privacy",
-	.id_table	= amz_privacy_ids,
+	.event = amz_privacy_input_event,
+	.connect = amz_privacy_input_connect,
+	.disconnect = amz_privacy_input_disconnect,
+	.name = "amz_privacy",
+	.id_table = amz_privacy_ids,
 };
 
 int amz_priv_trigger(int on)
@@ -378,6 +385,9 @@ static ssize_t privacy_trigger_store(struct device *dev,
 	struct amz_privacy *priv = dev_get_drvdata(dev);
 	int value;
 
+	if (priv->state_input)
+		return -EOPNOTSUPP;
+
 	if (kstrtoint(buf, 10, &value))
 		return -EPERM;
 
@@ -439,6 +449,9 @@ static ssize_t shutdown_dialog_state_store(struct device *dev,
 	struct amz_privacy *priv = dev_get_drvdata(dev);
 	int value;
 
+	if (priv->state_input)
+		return -EOPNOTSUPP;
+
 	if (kstrtoint(buf, 10, &value))
 		return -EPERM;
 
@@ -487,8 +500,8 @@ static DEVICE_ATTR(privacy_trigger, 0664, privacy_trigger_show,
 		   privacy_trigger_store);
 static DEVICE_ATTR_RO(privacy_state);
 static DEVICE_ATTR_RO(privacy_timer_on);
-static DEVICE_ATTR(shutdown_dialog_state, 0664,
-		   shutdown_dialog_state_show, shutdown_dialog_state_store);
+static DEVICE_ATTR(shutdown_dialog_state, 0664, shutdown_dialog_state_show,
+		   shutdown_dialog_state_store);
 static DEVICE_ATTR(power_button_state, 0664, power_button_state_show, NULL);
 
 /*
@@ -496,26 +509,29 @@ static DEVICE_ATTR(power_button_state, 0664, power_button_state_show, NULL);
  * software mute can light the button's lamp. 1 lights it, 0 clears it; while the
  * hardware latch is engaged the button owns the lamp and 0 is refused.
  */
-static ssize_t mute_lamp_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
+static ssize_t mute_lamp_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
 {
 	struct amz_privacy *priv = dev_get_drvdata(dev);
 
 	/* Not supported on a latched board: a value here would claim a lamp this
 	   control cannot drive. */
-	if (priv->hw_latch)
+	if (priv->hw_latch || priv->state_input)
 		return -EOPNOTSUPP;
 
 	return sysfs_emit(buf, "%d\n", priv->mute_lamp ? 1 : 0);
 }
 
 static ssize_t mute_lamp_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
+			       struct device_attribute *attr, const char *buf,
+			       size_t count)
 {
 	struct amz_privacy *priv = dev_get_drvdata(dev);
 	bool on;
 	int ret;
+
+	if (priv->state_input)
+		return -EOPNOTSUPP;
 
 	ret = kstrtobool(buf, &on);
 	if (ret)
@@ -588,9 +604,10 @@ static const struct attribute_group amz_privacy_group = {
  * @con_id is the property name without its "-gpio" suffix; gpiolib finds
  * both "<con_id>-gpios" and the legacy "<con_id>-gpio" used by the board DT.
  */
-static struct gpio_desc *
-amz_privacy_get_optional_gpio(struct device *dev, const char *con_id,
-			      enum gpiod_flags flags, const char *label)
+static struct gpio_desc *amz_privacy_get_optional_gpio(struct device *dev,
+						       const char *con_id,
+						       enum gpiod_flags flags,
+						       const char *label)
 {
 	struct gpio_desc *gpio;
 
@@ -612,13 +629,34 @@ static int amz_privacy_preserve_output(struct gpio_desc *gpio)
 	return gpiod_direction_output_raw(gpio, value);
 }
 
+/*
+ * The privacy switch is a hardware latch state line on boards whose switch is
+ * read-only: userspace learns the state from the interrupt, and the switch, not
+ * software, owns it.
+ */
+static irqreturn_t amz_privacy_state_irq(int irq, void *data)
+{
+	struct amz_privacy *priv = data;
+	int value;
+
+	mutex_lock(&amz_privacy_lock);
+	value = gpiod_get_value_cansleep(priv->privacy_state_gpio);
+	if (value >= 0 && value != priv->cur_priv) {
+		priv->cur_priv = value;
+		amz_privacy_notify(priv, "privacy_state");
+	}
+	mutex_unlock(&amz_privacy_lock);
+
+	return IRQ_HANDLED;
+}
+
 static int amz_privacy_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct amz_privacy *priv;
 	bool initially_private = false;
 	u32 hw_latch = 0;
-	int ret;
+	int ret, irq;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -627,6 +665,24 @@ static int amz_privacy_probe(struct platform_device *pdev)
 	priv->dev = dev;
 	device_property_read_u32(dev, "hw_latch", &hw_latch);
 	priv->hw_latch = !!hw_latch;
+
+	priv->privacy_state_gpio = amz_privacy_get_optional_gpio(
+		dev, "privacy-state", GPIOD_IN, "amz-privacy-state");
+	if (IS_ERR(priv->privacy_state_gpio))
+		return dev_err_probe(dev, PTR_ERR(priv->privacy_state_gpio),
+				     "failed to get privacy-state GPIO\n");
+
+	if (priv->privacy_state_gpio) {
+		ret = gpiod_get_value_cansleep(priv->privacy_state_gpio);
+		if (ret < 0)
+			return dev_err_probe(
+				dev, ret,
+				"failed to read privacy-state GPIO\n");
+		priv->state_input = true;
+		priv->cur_priv = !!ret;
+		priv->hw_latch = false;
+		goto skip_outputs;
+	}
 
 	priv->privacy_gpio = devm_gpiod_get(dev, NULL, GPIOD_ASIS);
 	if (IS_ERR(priv->privacy_gpio))
@@ -640,24 +696,19 @@ static int amz_privacy_probe(struct platform_device *pdev)
 
 	ret = gpiod_get_raw_value_cansleep(priv->privacy_gpio);
 	if (ret < 0)
-		return dev_err_probe(dev, ret,
-				     "failed to read privacy GPIO\n");
+		return dev_err_probe(dev, ret, "failed to read privacy GPIO\n");
 	priv->cur_priv = !!ret;
 
-	priv->bright_state_gpio =
-		amz_privacy_get_optional_gpio(dev, "bright-state",
-					      GPIOD_ASIS,
-					      "amz-bright-state");
+	priv->bright_state_gpio = amz_privacy_get_optional_gpio(
+		dev, "bright-state", GPIOD_ASIS, "amz-bright-state");
 	if (IS_ERR(priv->bright_state_gpio))
 		return dev_err_probe(dev, PTR_ERR(priv->bright_state_gpio),
 				     "failed to get bright-state GPIO\n");
 
 	/* Also accept the property used by the supplied vendor source. */
 	if (!priv->bright_state_gpio)
-		priv->bright_state_gpio =
-			amz_privacy_get_optional_gpio(dev, "mute",
-						      GPIOD_ASIS,
-						      "amz-mute");
+		priv->bright_state_gpio = amz_privacy_get_optional_gpio(
+			dev, "mute", GPIOD_ASIS, "amz-mute");
 	if (IS_ERR(priv->bright_state_gpio))
 		return dev_err_probe(dev, PTR_ERR(priv->bright_state_gpio),
 				     "failed to get mute GPIO\n");
@@ -665,23 +716,23 @@ static int amz_privacy_probe(struct platform_device *pdev)
 	if (priv->bright_state_gpio) {
 		ret = amz_privacy_preserve_output(priv->bright_state_gpio);
 		if (ret)
-			return dev_err_probe(dev, ret,
-					     "failed to configure bright-state GPIO\n");
+			return dev_err_probe(
+				dev, ret,
+				"failed to configure bright-state GPIO\n");
 	}
 
 	if (priv->hw_latch) {
-		priv->public_hw_state_gpio =
-			amz_privacy_get_optional_gpio(dev,
-						      "public_hw_st-gpio",
-						      GPIOD_IN,
-						      "amz-public-hw-state");
+		priv->public_hw_state_gpio = amz_privacy_get_optional_gpio(
+			dev, "public_hw_st-gpio", GPIOD_IN,
+			"amz-public-hw-state");
 		if (IS_ERR(priv->public_hw_state_gpio))
-			return dev_err_probe(dev,
-					     PTR_ERR(priv->public_hw_state_gpio),
-					     "failed to get public-hw GPIO\n");
+			return dev_err_probe(
+				dev, PTR_ERR(priv->public_hw_state_gpio),
+				"failed to get public-hw GPIO\n");
 		if (!priv->public_hw_state_gpio)
-			return dev_err_probe(dev, -EINVAL,
-					     "hw_latch requires public_hw_st-gpio\n");
+			return dev_err_probe(
+				dev, -EINVAL,
+				"hw_latch requires public_hw_st-gpio\n");
 
 		ret = gpiod_get_raw_value_cansleep(priv->public_hw_state_gpio);
 		if (ret < 0)
@@ -690,6 +741,7 @@ static int amz_privacy_probe(struct platform_device *pdev)
 		initially_private = !ret;
 	}
 
+skip_outputs:
 	platform_set_drvdata(pdev, priv);
 
 	mutex_lock(&amz_privacy_lock);
@@ -719,9 +771,44 @@ static int amz_privacy_probe(struct platform_device *pdev)
 			mutex_lock(&amz_privacy_lock);
 			amz_privacy_data = NULL;
 			mutex_unlock(&amz_privacy_lock);
-			return dev_err_probe(dev, ret,
-					     "failed to restore latched privacy\n");
+			return dev_err_probe(
+				dev, ret,
+				"failed to restore latched privacy\n");
 		}
+	}
+
+	if (priv->state_input) {
+		irq = gpiod_to_irq(priv->privacy_state_gpio);
+		if (irq < 0) {
+			sysfs_remove_group(&dev->kobj, &amz_privacy_group);
+			mutex_lock(&amz_privacy_lock);
+			amz_privacy_data = NULL;
+			mutex_unlock(&amz_privacy_lock);
+			return dev_err_probe(
+				dev, irq, "failed to map privacy-state IRQ\n");
+		}
+
+		ret = devm_request_threaded_irq(
+			dev, irq, NULL, amz_privacy_state_irq,
+			IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING |
+				IRQF_ONESHOT,
+			DRIVER_NAME, priv);
+		if (ret) {
+			sysfs_remove_group(&dev->kobj, &amz_privacy_group);
+			mutex_lock(&amz_privacy_lock);
+			amz_privacy_data = NULL;
+			mutex_unlock(&amz_privacy_lock);
+			return dev_err_probe(
+				dev, ret,
+				"failed to request privacy-state IRQ\n");
+		}
+
+		/*
+		 * The line may have moved between the probe-time read and the
+		 * handler going live; resample now that edges are delivered, so
+		 * privacy_state never reports the stale level.
+		 */
+		amz_privacy_state_irq(irq, priv);
 	}
 
 	/*
@@ -730,16 +817,27 @@ static int amz_privacy_probe(struct platform_device *pdev)
 	 * boot state is correct, only the key stops toggling it -- so say so
 	 * and carry on rather than refusing to probe.
 	 */
-	ret = input_register_handler(&amz_privacy_input_handler);
-	if (ret)
-		dev_warn(dev, "mute key handler not registered (%d); the button cannot leave privacy\n",
-			 ret);
-	else
-		priv->input_handler_registered = true;
+	/* A read-only state line has no key to bind: the switch owns the state. */
+	if (!priv->state_input) {
+		ret = input_register_handler(&amz_privacy_input_handler);
+		if (ret)
+			dev_warn(
+				dev,
+				"mute key handler not registered (%d); the button cannot leave privacy\n",
+				ret);
+		else
+			priv->input_handler_registered = true;
+	}
 
-	dev_info(dev, "registered (hardware latch %s, mute key %s)\n",
-		 priv->hw_latch ? "enabled" : "disabled",
-		 priv->input_handler_registered ? "bound" : "unbound");
+	if (priv->state_input)
+		dev_info(
+			dev,
+			"registered (read-only privacy-state input, initial state %s)\n",
+			priv->cur_priv ? "private" : "public");
+	else
+		dev_info(dev, "registered (hardware latch %s, mute key %s)\n",
+			 priv->hw_latch ? "enabled" : "disabled",
+			 priv->input_handler_registered ? "bound" : "unbound");
 	return 0;
 }
 
@@ -771,7 +869,7 @@ static const struct of_device_id amz_privacy_of_match[] = {
 	{ .compatible = "amazon,amz-privacy" },
 	/* Name-only fallback for unmodified vendor device trees. */
 	{ .name = "amz_privacy" },
-	{ }
+	{}
 };
 MODULE_DEVICE_TABLE(of, amz_privacy_of_match);
 
