@@ -139,11 +139,12 @@ This repository must not be used to flash a device directly.
 
 ## Kernel target scaffolding
 
-`libreecho/targets.json` maps `radar_puffin` and `biscuit` to their kernel
-`defconfig` and `dtb`. Both currently use `mt8163_arm32_defconfig` and
-`libreecho-radar-puffin.dtb`: this is deliberate build parity, **not Biscuit
-hardware acceptance**. Biscuit will get its own reviewed DTS and hardware
-validation in a later change; no new DTS or audio/config fragments are added here.
+`libreecho/targets.json` maps each target to an `(arch, defconfig, dtb, image)`
+tuple. `radar_puffin` and `biscuit` use `arm`, `mt8163_arm32_defconfig`,
+`libreecho-radar-puffin.dtb` and `zImage`: this is deliberate build parity,
+**not Biscuit hardware acceptance**. Biscuit will get its own reviewed DTS and
+hardware validation in a later change. `lidar` uses `arm64`,
+`mt8167_arm64_defconfig`, `libreecho-lidar.dtb` and `Image`.
 
 Validate the table and exercise its CI planner without hardware:
 
@@ -152,14 +153,17 @@ python3 -B libreecho/validate_targets.py
 python3 -B libreecho/test_targets.py
 ```
 
-CI reads this table, builds each distinct `(defconfig, dtb)` tuple once, then
-uses a publication matrix over both targets to upload
-`libreecho-kernel-<target>-zImage`, `-dtb`, `-System.map` and `-config` artifacts.
-At parity these are copies of the same build outputs. The legacy Radar bundle
-`libreecho-linux-arm32-<sha>` is also retained. Changing Biscuit's tuple to valid
-in-tree sources adds a build lane automatically; unknown IDs or missing sources
-fail validation. The build still uses `olddefconfig`, `zImage dtbs`, the existing
-ARMHF GCC/linker flags and no config fragments, preserving Radar's CI recipe.
+CI reads this table, builds each distinct `(arch, defconfig, dtb, image)` tuple
+once with `olddefconfig` and `<image> dtbs`, using the ARMHF GCC cross compiler
+for `arm` and the aarch64 GCC cross compiler for `arm64`. A publication matrix
+then uploads `libreecho-kernel-<target>-<image>` (`-zImage` or `-Image`),
+`-dtb`, `-System.map` and `-config` artifacts; at parity these are copies of the
+same build outputs. The legacy Radar bundle `libreecho-linux-arm32-<sha>` is
+still retained. The build rejects an incomplete table, unknown IDs or missing
+sources, and a divergent tuple automatically gets its own build lane. The `arm`
+lane asserts `CONFIG_CFG80211_WEXT=y` and the dual-role MUSB configuration from
+the resolved `.config`; the `arm64` lane asserts `CONFIG_COMPAT=y` because
+Lidar runs 32-bit userspace.
 
 ## Contract tests
 

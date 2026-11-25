@@ -6,7 +6,9 @@ from pathlib import Path, PurePosixPath
 import re
 import sys
 
-TARGETS = ("radar_puffin", "biscuit")
+TARGETS = ("radar_puffin", "biscuit", "lidar")
+FIELDS = {"arch", "defconfig", "dtb", "image"}
+ARCH_IMAGES = {"arm": "zImage", "arm64": "Image"}
 
 
 def unique_keys(pairs):
@@ -21,12 +23,18 @@ def unique_keys(pairs):
 def load_targets(root, table):
     targets = json.loads(table.read_text(), object_pairs_hook=unique_keys)
     if not isinstance(targets, dict) or set(targets) != set(TARGETS):
-        raise ValueError(f"target IDs must be exactly {', '.join(TARGETS)}")
+        raise ValueError(
+            f"target IDs must be exactly {', '.join(TARGETS)}")
     for target, settings in targets.items():
-        if not isinstance(settings, dict) or set(settings) != {"defconfig", "dtb"}:
-            raise ValueError(f"{target}: expected only defconfig and dtb")
+        if not isinstance(settings, dict) or set(settings) != FIELDS:
+            raise ValueError(
+                f"{target}: expected only arch, defconfig, dtb and image")
+        arch = settings["arch"]
         config = settings["defconfig"]
         dtb = settings["dtb"]
+        image = settings["image"]
+        if arch not in ARCH_IMAGES:
+            raise ValueError(f"{target}: unsupported arch {arch!r}")
         if not isinstance(config, str) or not re.fullmatch(r"[A-Za-z0-9_]+_defconfig", config):
             raise ValueError(f"{target}: invalid defconfig name")
         if (not isinstance(dtb, str)
@@ -34,8 +42,10 @@ def load_targets(root, table):
                 or any(part in {"", ".", ".."} for part in dtb.split("/"))
                 or PurePosixPath(dtb).is_absolute()):
             raise ValueError(f"{target}: invalid dtb path")
-        for source in (root / "arch/arm/configs" / config,
-                       root / "arch/arm/boot/dts" / PurePosixPath(dtb).with_suffix(".dts")):
+        if image != ARCH_IMAGES[arch]:
+            raise ValueError(f"{target}: {arch} image must be {ARCH_IMAGES[arch]}")
+        for source in (root / "arch" / arch / "configs" / config,
+                       root / "arch" / arch / "boot/dts" / PurePosixPath(dtb).with_suffix(".dts")):
             if not source.is_file() or not source.resolve().is_relative_to(root.resolve()):
                 raise ValueError(f"{target}: missing or out-of-tree source: {source}")
     return targets
@@ -46,10 +56,12 @@ def plan_matrices(targets):
     publish = []
     owners = {}
     # Radar remains the canonical build/legacy artifact owner at parity,
-    # independent of JSON key order. A distinct Biscuit tuple gets its own lane.
-    for target in TARGETS:
+    # independent of JSON key order. A distinct Biscuit or Lidar tuple gets
+    # its own lane.
+    for target in (t for t in TARGETS if t in targets):
         settings = targets[target]
-        key = (settings["defconfig"], settings["dtb"])
+        key = (settings["arch"], settings["defconfig"], settings["dtb"],
+               settings["image"])
         if key not in owners:
             owners[key] = target
             builds.append({"target": target, **settings})
