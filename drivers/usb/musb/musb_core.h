@@ -358,6 +358,11 @@ struct musb {
 	bool			session;
 	unsigned long		quirk_retries;
 	bool			is_host;
+	/*
+	 * Set across system suspend: rx_kick work must not touch the
+	 * controller while the platform clocks and interrupts are off.
+	 */
+	bool			rx_kicks_disabled;
 
 	int			a_wait_bcon;	/* VBUS timeout in msecs */
 	unsigned long		idle_timeout;	/* Next timeout in jiffies */

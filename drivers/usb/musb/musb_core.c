@@ -2822,6 +2822,8 @@ static int musb_suspend(struct device *dev)
 		;
 	musb->flush_irq_work = false;
 
+	musb_gadget_disable_rx_kicks(musb);
+
 	if (!(musb->ops->quirks & MUSB_PRESERVE_SESSION))
 		musb_writeb(musb->mregs, MUSB_DEVCTL, 0);
 
@@ -2870,6 +2872,7 @@ static int musb_resume(struct device *dev)
 	if ((devctl & mask) != (musb->context.devctl & mask))
 		musb->port1_status = 0;
 
+	musb_gadget_enable_rx_kicks(musb);
 	musb_enable_interrupts(musb);
 	musb_platform_enable(musb);
 

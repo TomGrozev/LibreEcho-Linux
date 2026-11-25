@@ -148,6 +148,21 @@ __acquires(ep->musb->lock)
 	usb_gadget_giveback_request(&req->ep->end_point, &req->request);
 	spin_lock(&musb->lock);
 	ep->busy = busy;
+
+	if (!ep->busy && ep->rx_kick_deferred) {
+		ep->rx_kick_deferred = false;
+		if (!queue_work(system_wq, &ep->rx_kick))
+			pm_runtime_put_noidle(musb->controller);
+	}
+}
+
+static void musb_g_defer_rx_kick(struct musb *musb, struct musb_ep *musb_ep)
+{
+	if (musb_ep->rx_kick_deferred)
+		return;
+
+	pm_runtime_get_noresume(musb->controller);
+	musb_ep->rx_kick_deferred = true;
 }
 
 /* ----------------------------------------------------------------------- */
@@ -822,6 +837,17 @@ void musb_g_rx(struct musb *musb, u8 epnum)
 	csr = musb_readw(epio, MUSB_RXCSR);
 	dma = is_dma_capable() ? musb_ep->dma : NULL;
 
+	/*
+	 * A giveback is in progress on this endpoint, so the packet can't be
+	 * handled now: the function could get its data out of order. Check for
+	 * the packet once the giveback is done.
+	 * Do not defer DMA completions: only usb_ep_dequeue() can overlap them.
+	 */
+	if (musb_ep->busy && !(csr & MUSB_RXCSR_DMAENAB)) {
+		musb_g_defer_rx_kick(musb, musb_ep);
+		return;
+	}
+
 	musb_dbg(musb, "<== %s, rxcsr %04x%s %p", musb_ep->end_point.name,
 			csr, dma ? " (dma)" : "", request);
 
@@ -1117,6 +1143,12 @@ static int musb_gadget_disable(struct usb_ep *ep)
 
 	/* abort all pending DMA and requests */
 	nuke(musb_ep, -ESHUTDOWN);
+	if (cancel_work(&musb_ep->rx_kick))
+		pm_runtime_put_autosuspend(musb->controller);
+	if (musb_ep->rx_kick_deferred) {
+		musb_ep->rx_kick_deferred = false;
+		pm_runtime_put_autosuspend(musb->controller);
+	}
 
 	musb_ep->desc = NULL;
 	musb_ep->end_point.desc = NULL;
@@ -1168,6 +1200,7 @@ void musb_free_request(struct usb_ep *ep, struct usb_request *req)
  */
 void musb_ep_restart(struct musb *musb, struct musb_request *req)
 {
+	u16 csr;
 	void __iomem *epio = req->ep->hw_ep->regs;
 
 	trace_musb_req_start(req);
@@ -1177,10 +1210,44 @@ void musb_ep_restart(struct musb *musb, struct musb_request *req)
 		req->epnum, req->tx, req->request.length,
 		musb_readw(epio, req->tx ? MUSB_TXCSR : MUSB_RXCSR),
 		req->tx ? 0 : musb_readw(epio, MUSB_RXCOUNT));
-	if (req->tx)
+	if (req->tx) {
 		txstate(musb, req);
-	else
-		rxstate(musb, req);
+	} else {
+		csr = musb_readw(epio, MUSB_RXCSR);
+		if (csr & MUSB_RXCSR_RXPKTRDY) {
+			pm_runtime_get_noresume(musb->controller);
+			if (!queue_work(system_wq, &req->ep->rx_kick))
+				pm_runtime_put_noidle(musb->controller);
+		}
+	}
+}
+
+static void musb_g_rx_kick(struct work_struct *work)
+{
+	struct musb_ep *musb_ep = container_of(work, struct musb_ep, rx_kick);
+	struct musb *musb = musb_ep->musb;
+	unsigned long flags;
+	u8 epnum = musb_ep->current_epnum;
+	u16 csr;
+
+	spin_lock_irqsave(&musb->lock, flags);
+
+	if (!musb_ep->desc || musb->is_runtime_suspended ||
+	    musb->rx_kicks_disabled)
+		goto out;
+
+	if (musb_ep->busy) {
+		musb_g_defer_rx_kick(musb, musb_ep);
+		goto out;
+	}
+
+	musb_ep_select(musb->mregs, epnum);
+	csr = musb_readw(musb->endpoints[epnum].regs, MUSB_RXCSR);
+	if (csr & MUSB_RXCSR_RXPKTRDY)
+		musb_g_rx(musb, epnum);
+out:
+	spin_unlock_irqrestore(&musb->lock, flags);
+	pm_runtime_put_autosuspend(musb->controller);
 }
 
 static int musb_ep_restart_resume_work(struct musb *musb, void *data)
@@ -1264,6 +1331,15 @@ static int musb_gadget_queue(struct usb_ep *ep, struct usb_request *req,
 				__func__, status);
 			list_del(&request->list);
 		}
+	} else if (musb_ep->busy && !request->tx &&
+		   &request->list == musb_ep->req_list.next) {
+		/*
+		 * A giveback is in progress on this endpoint, so the request
+		 * can't be started now. A packet may already be waiting, its
+		 * interrupt having found no request. Check for the packet once
+		 * the giveback is done.
+		 */
+		musb_g_defer_rx_kick(musb, musb_ep);
 	}
 
 unlock:
@@ -1713,6 +1789,7 @@ init_peripheral_ep(struct musb *musb, struct musb_ep *ep, u8 epnum, int is_in)
 	ep->is_in = is_in;
 
 	INIT_LIST_HEAD(&ep->req_list);
+	INIT_WORK(&ep->rx_kick, musb_g_rx_kick);
 
 	sprintf(ep->name, "ep%d%s", epnum,
 			(!epnum || hw_ep->is_shared_fifo) ? "" : (
@@ -1822,6 +1899,61 @@ void musb_gadget_cleanup(struct musb *musb)
 
 	cancel_delayed_work_sync(&musb->gadget_work);
 	usb_del_gadget_udc(&musb->g);
+
+	musb_gadget_disable_rx_kicks(musb);
+}
+
+static void musb_g_disable_rx_kick(struct musb *musb, struct musb_ep *musb_ep)
+{
+	if (!musb_ep->rx_kick.func)
+		return;
+
+	if (cancel_work_sync(&musb_ep->rx_kick))
+		pm_runtime_put_noidle(musb->controller);
+	if (musb_ep->rx_kick_deferred) {
+		musb_ep->rx_kick_deferred = false;
+		pm_runtime_put_noidle(musb->controller);
+	}
+}
+
+void musb_gadget_disable_rx_kicks(struct musb *musb)
+{
+	int i;
+
+	musb->rx_kicks_disabled = true;
+
+	for (i = 0; i < musb->nr_endpoints; i++) {
+		musb_g_disable_rx_kick(musb, &musb->endpoints[i].ep_in);
+		musb_g_disable_rx_kick(musb, &musb->endpoints[i].ep_out);
+	}
+}
+
+void musb_gadget_enable_rx_kicks(struct musb *musb)
+{
+	int i;
+
+	musb->rx_kicks_disabled = false;
+
+	for (i = 0; i < musb->nr_endpoints; i++) {
+		struct musb_ep *eps[2] = {
+			&musb->endpoints[i].ep_in,
+			&musb->endpoints[i].ep_out,
+		};
+		int j;
+
+		for (j = 0; j < 2; j++) {
+			struct musb_ep *ep = eps[j];
+
+			/* A kick deferred across suspend holds a PM reference
+			 * that the work item releases when it runs.
+			 */
+			if (!ep->rx_kick.func || !ep->rx_kick_deferred)
+				continue;
+			ep->rx_kick_deferred = false;
+			if (!queue_work(system_wq, &ep->rx_kick))
+				pm_runtime_put_noidle(musb->controller);
+		}
+	}
 }
 
 /*
