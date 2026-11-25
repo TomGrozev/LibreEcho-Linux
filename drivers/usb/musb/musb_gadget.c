@@ -264,6 +264,7 @@ static void txstate(struct musb *musb, struct musb_request *req)
 	csr = musb_readw(epio, MUSB_TXCSR);
 
 	request = &req->request;
+
 	fifo_count = min(max_ep_writesize(musb, musb_ep),
 			(int)(request->length - request->actual));
 
@@ -284,7 +285,14 @@ static void txstate(struct musb *musb, struct musb_request *req)
 			csr);
 
 #ifndef	CONFIG_MUSB_PIO_ONLY
-	if (is_buffer_mapped(req)) {
+	/*
+	 * The Inventra DMA engine of the MT8516 and MT8163 cannot be used
+	 * for isochronous IN, so the glue sets MUSB_G_ISOC_NO_DMA to keep
+	 * those transfers on the PIO path.
+	 */
+	if (is_buffer_mapped(req) &&
+	    !((musb->ops->quirks & MUSB_G_ISOC_NO_DMA) &&
+	      musb_ep->type == USB_ENDPOINT_XFER_ISOC)) {
 		struct dma_controller	*c = musb->dma_controller;
 		size_t request_size;
 
@@ -1944,7 +1952,8 @@ void musb_gadget_enable_rx_kicks(struct musb *musb)
 		for (j = 0; j < 2; j++) {
 			struct musb_ep *ep = eps[j];
 
-			/* A kick deferred across suspend holds a PM reference
+			/*
+			 * A kick deferred across suspend holds a PM reference
 			 * that the work item releases when it runs.
 			 */
 			if (!ep->rx_kick.func || !ep->rx_kick_deferred)

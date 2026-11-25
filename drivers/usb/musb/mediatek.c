@@ -1044,7 +1044,7 @@ static int mtk_musb_exit(struct musb *musb)
 }
 
 static const struct musb_platform_ops mtk_musb_ops = {
-	.quirks = MUSB_DMA_INVENTRA,
+	.quirks = MUSB_DMA_INVENTRA | MUSB_G_ISOC_NO_DMA,
 	.init = mtk_musb_init,
 	.enable = mtk_musb_enable,
 	.get_toggle = mtk_musb_get_toggle,
