@@ -2535,12 +2535,17 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
 		if (status < 0)
 			goto fail3;
 		status = musb_platform_set_mode(musb, MUSB_HOST);
+		if (status < 0)
+			musb_host_cleanup(musb);
 		break;
 	case MUSB_PERIPHERAL:
 		status = musb_gadget_setup(musb);
 		if (status < 0)
 			goto fail3;
 		status = musb_platform_set_mode(musb, MUSB_PERIPHERAL);
+		/* fail3 frees musb; a gadget left on the UDC bus would dangle. */
+		if (status < 0)
+			musb_gadget_cleanup(musb);
 		break;
 	case MUSB_OTG:
 		status = musb_host_setup(musb, plat->power);
@@ -2552,6 +2557,10 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
 			goto fail3;
 		}
 		status = musb_platform_set_mode(musb, MUSB_OTG);
+		if (status < 0) {
+			musb_gadget_cleanup(musb);
+			musb_host_cleanup(musb);
+		}
 		break;
 	default:
 		dev_err(dev, "unsupported port mode %d\n", musb->port_mode);
