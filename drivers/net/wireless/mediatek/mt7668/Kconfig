@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MT7668_SDIO
+	tristate "MediaTek MT7668 (gen4) SDIO WLAN support"
+	depends on MMC
+	depends on CFG80211
+	help
+	  This is MediaTek's gen4 WLAN driver for the MT7668 SDIO combo
+	  chip, as found in the Amazon Echo Plus (2nd generation) and other
+	  MT8167/MT8516 devices. Bluetooth on the same chip is handled by
+	  btmtksdio.
+
+	  The driver needs the MediaTek firmware files
+	  (WIFI_RAM_CODE_MT7668.bin, WIFI_RAM_CODE2_SDIO_MT7668.bin) and
+	  the ROM patch, which are not part of linux-firmware and must be
+	  taken from the device's vendor image. Install the ROM patch as
+	  mt7668_patch_e1_hdr.bin or mt7668_patch_e2_hdr.bin, matching the
+	  ROM version reported by the chip.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called mt7668_sdio.
