@@ -39,6 +39,7 @@
 #define RT5739_ENVSEL0_MASK	BIT(0)
 
 #define RT5733_CHIPDIE_ID	0x1
+#define RT5739_CHIPDIE_ID	0x0
 #define RT5733_VOLT_MINUV	270000
 #define RT5733_VOLT_MAXUV	1401250
 #define RT5733_VOLT_STPUV	6250
@@ -262,6 +263,7 @@ static int rt5739_probe(struct i2c_client *i2c)
 	struct regulator_dev *rdev;
 	bool vsel_acth;
 	unsigned int vid;
+	u8 did;
 	int ret;
 
 	desc = devm_kzalloc(dev, sizeof(*desc), GFP_KERNEL);
@@ -288,7 +290,16 @@ static int rt5739_probe(struct i2c_client *i2c)
 
 	vsel_acth = device_property_read_bool(dev, "richtek,vsel-active-high");
 
-	rt5739_init_regulator_desc(desc, vsel_acth, vid & RT5739_DID_MASK);
+	did = vid & RT5739_DID_MASK;
+	/*
+	 * RT5738 shares the RT5739 register map and its 300-1300 mV range in
+	 * 5 mV steps. Its die ID is not documented, so never let it select
+	 * the RT5733 voltage table.
+	 */
+	if (device_is_compatible(dev, "richtek,rt5738"))
+		did = RT5739_CHIPDIE_ID;
+
+	rt5739_init_regulator_desc(desc, vsel_acth, did);
 
 	cfg.dev = dev;
 	cfg.of_node = dev_of_node(dev);
@@ -302,6 +313,7 @@ static int rt5739_probe(struct i2c_client *i2c)
 
 static const struct of_device_id rt5739_device_table[] = {
 	{ .compatible = "richtek,rt5733" },
+	{ .compatible = "richtek,rt5738" },
 	{ .compatible = "richtek,rt5739" },
 	{ /* sentinel */ }
 };
