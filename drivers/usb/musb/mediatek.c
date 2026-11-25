@@ -908,6 +908,9 @@ static int mtk_musb_set_mode(struct musb *musb, u8 mode)
 	}
 
 	if (musb->port_mode != MUSB_OTG) {
+		/* musb_init_controller() sets a fixed-role port to its own mode. */
+		if (mode == musb->port_mode)
+			return 0;
 		dev_err(glue->dev, "Does not support changing modes\n");
 		return -EINVAL;
 	}
