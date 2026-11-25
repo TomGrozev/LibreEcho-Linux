@@ -217,7 +217,14 @@ static int mtk_hci_wmt_sync(struct hci_dev *hdev,
 	}
 
 	/* Parse and handle the return WMT event */
-	wmt_evt = (struct btmtk_hci_wmt_evt *)bdev->evt_skb->data;
+	wmt_evt = skb_pull_data(bdev->evt_skb, sizeof(*wmt_evt));
+	if (!wmt_evt) {
+		bt_dev_err(hdev, "WMT event too short (%u bytes)",
+			   bdev->evt_skb->len);
+		err = -EINVAL;
+		goto err_free_skb;
+	}
+
 	if (wmt_evt->whdr.op != hdr->op) {
 		bt_dev_err(hdev, "Wrong op received %d expected %d",
 			   wmt_evt->whdr.op, hdr->op);
@@ -233,6 +240,17 @@ static int mtk_hci_wmt_sync(struct hci_dev *hdev,
 			status = BTMTK_WMT_PATCH_DONE;
 		break;
 	case BTMTK_WMT_FUNC_CTRL:
+		if (!skb_pull_data(bdev->evt_skb,
+				   sizeof(wmt_evt_funcc->status))) {
+			/* A plain enable/disable request is acked with just
+			 * the WMT header and no trailing status word; the
+			 * result is carried in the header's own flag byte.
+			 */
+			status = wmt_evt->whdr.flag ? BTMTK_WMT_ON_UNDONE :
+						       BTMTK_WMT_ON_DONE;
+			break;
+		}
+
 		wmt_evt_funcc = (struct btmtk_hci_wmt_evt_funcc *)wmt_evt;
 		if (be16_to_cpu(wmt_evt_funcc->status) == 0x404)
 			status = BTMTK_WMT_ON_DONE;
@@ -405,12 +423,44 @@ out:
 	return err;
 }
 
+/* The MT7668 firmware in linux-firmware (mt7668pr2h.bin) leaves octets 25-28
+ * of Read Local Supported Commands empty, i.e. all Bluetooth 4.0 LE commands,
+ * although it executes them. The core then never enables the LE Advertising
+ * Report and LE Connection Complete events, so LE scans find nothing. Report
+ * the Bluetooth 4.0 LE commands, which this controller executes.
+ */
+static void btmtksdio_fixup_local_cmds(struct btmtksdio_dev *bdev,
+				       struct sk_buff *skb)
+{
+	static const u8 le_cmds[] = { 0xf7, 0xff, 0xff, 0x7f };
+	struct hci_event_hdr *hdr = (void *)skb->data;
+	struct hci_ev_cmd_complete *cc;
+	struct hci_rp_read_local_commands *rp;
+
+	if (bdev->data->chipid != 0x7668 || hdr->evt != HCI_EV_CMD_COMPLETE ||
+	    skb->len < sizeof(*hdr) + sizeof(*cc) + sizeof(*rp))
+		return;
+
+	cc = (void *)(hdr + 1);
+	if (le16_to_cpu(cc->opcode) != HCI_OP_READ_LOCAL_COMMANDS)
+		return;
+
+	rp = (void *)(cc + 1);
+	if (rp->status || memchr_inv(&rp->commands[25], 0, sizeof(le_cmds)))
+		return;
+
+	memcpy(&rp->commands[25], le_cmds, sizeof(le_cmds));
+}
+
 static int btmtksdio_recv_event(struct hci_dev *hdev, struct sk_buff *skb)
 {
 	struct btmtksdio_dev *bdev = hci_get_drvdata(hdev);
 	struct hci_event_hdr *hdr = (void *)skb->data;
 	u8 evt = hdr->evt;
 	int err;
+
+	/* before the clone below, which shares the data */
+	btmtksdio_fixup_local_cmds(bdev, skb);
 
 	/* When someone waits for the WMT event, the skb is being cloned
 	 * and being processed the events from there then.
