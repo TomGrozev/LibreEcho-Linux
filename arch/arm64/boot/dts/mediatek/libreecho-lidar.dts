@@ -385,8 +385,8 @@
 };
 
 /*
- * CPU rail: Richtek RT5739 buck at 0x57.  Measured on a PVT unit: ID1/ID2
- * read 0 (RT5739, 300-1300 mV, 5 mV steps), both banks hold 0xaa
+ * CPU rail: Richtek RT5738 buck at 0x57.  Measured on a PVT unit: ID1/ID2
+ * read 0 (RT5739-class 300-1300 mV, 5 mV steps), both banks hold 0xaa
  * (1.150 V), and VSEL (GPIO9) is an input pulled high, so the active bank is
  * NSEL1.  GPIO9 is left untouched.
  */
@@ -396,7 +396,7 @@
 	status = "okay";
 
 	vproc: regulator@57 {
-		compatible = "richtek,rt5739";
+		compatible = "richtek,rt5738";
 		reg = <0x57>;
 		regulator-name = "vproc";
 		regulator-min-microvolt = <1150000>;
