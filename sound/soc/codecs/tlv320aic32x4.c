@@ -1240,10 +1240,37 @@ static const struct regmap_range_cfg aic32x4_regmap_pages[] = {
 	},
 };
 
+/*
+ * Read-only status registers and the GPIO input levels change without a
+ * write, so they must never be served from the cache. Keep AIC32X4_PSEL
+ * cacheable: the cache is what preserves the page selector across reads.
+ */
+static bool aic32x4_volatile_reg(struct device *dev, unsigned int reg)
+{
+	if (reg == AIC32X4_RESET || reg == AIC32X4_GPIOCTL ||
+	    reg == AIC32X4_GAIN_APPLIED)
+		return true;
+	if (reg >= AIC32X4_ADC_FLAG && reg <= AIC32X4_DAC_FLAG2)
+		return true;
+	/* DAC/HP sticky flags: page 0 registers 42-45. */
+	return reg >= AIC32X4_REG(0, 42) && reg <= AIC32X4_REG(0, 45);
+}
+
 const struct regmap_config aic32x4_regmap_config = {
 	.max_register = AIC32X4_MAX_DSP_REG,
 	.ranges = aic32x4_regmap_pages,
 	.num_ranges = ARRAY_SIZE(aic32x4_regmap_pages),
+	.volatile_reg = aic32x4_volatile_reg,
+	/*
+	 * The page-select register reads back 0 on every page, so without a
+	 * cache regmap's page switch reads 0 as "already on page 0" and skips
+	 * the selector write. Every page-0 access after the DAC biquads left
+	 * the chip on page 44/45 would then be lost (the PCM volume writes
+	 * land in coefficient memory and read back correctly, so the mixer
+	 * looks applied while the DAC stays at 0 dB). The cache keeps the
+	 * last written selector value, so regmap sees the real page.
+	 */
+	.cache_type = REGCACHE_MAPLE,
 };
 EXPORT_SYMBOL(aic32x4_regmap_config);
 
