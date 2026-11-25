@@ -315,20 +315,6 @@ static ssize_t tsl2540_regs_get(struct tsl2540_chip *chip, char *buf,
 
 }
 
-void tsl2540_reg_log(struct tsl2540_chip *chip)
-{
-	char *buf;
-
-	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (buf) {
-		tsl2540_regs_get(chip, &buf[0], PAGE_SIZE);
-		pr_err("%s", buf);
-		kfree(buf);
-	} else {
-		dev_err(&chip->client->dev, "%s: out of memory!\n", __func__);
-	}
-}
-
 static ssize_t tsl2540_regs_dump(
 	struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -481,7 +467,7 @@ static void tsl2540_als_idev_close(struct input_dev *idev)
 #endif /* TSL2540_ENABLE_INPUT */
 
 #ifdef CONFIG_OF
-int tsl2540_init_dt(struct tsl2540_i2c_platform_data *pdata)
+static int tsl2540_init_dt(struct tsl2540_i2c_platform_data *pdata)
 {
 	struct device_node *np = pdata->of_node;
 	const char *str;
@@ -637,7 +623,7 @@ static int tsl2540_probe(struct i2c_client *client)
 			pdata->of_node = client->dev.of_node;
 			ret = tsl2540_init_dt(pdata);
 			if (ret)
-				return ret;
+				goto init_failed;
 		}
 	}
 #endif
@@ -875,6 +861,11 @@ pon_failed:
 	if (pdata->platform_teardown)
 		pdata->platform_teardown(dev);
 init_failed:
+#ifdef CONFIG_OF
+	/* Only the DT path allocates its own platform data. */
+	if (pdata && pdata != dev->platform_data)
+		kfree(pdata);
+#endif
 	dev_err(dev, "Probe failed.\n");
 	return ret;
 }
@@ -938,18 +929,53 @@ static SIMPLE_DEV_PM_OPS(tsl2540_pm_ops, tsl2540_suspend, tsl2540_resume);
 static void tsl2540_remove(struct i2c_client *client)
 {
 	struct tsl2540_chip *chip = i2c_get_clientdata(client);
+	struct device *dev = &client->dev;
 
 	pr_info("\nTSL2540: REMOVE()\n");
+
 #ifdef TSL2540_ENABLE_INTERRUPT
 	free_irq(client->irq, chip);
 #endif /* TSL2540_ENABLE_INTERRUPT */
+
+	/*
+	 * The sysfs groups go before anything that frees chip: their
+	 * callbacks and the input devices hold chip in drvdata, so leaving
+	 * them registered past kfree() turns a later read into a
+	 * use-after-free and makes a rebind fail with -EEXIST.  Removing a
+	 * group also waits for callbacks already in flight.
+	 */
+	sysfs_remove_group(&client->dev.kobj, &tsl2540_als_attr_group);
+#ifdef ABI_SET_GET_REGISTERS
+	sysfs_remove_group(&client->dev.kobj, &tsl2540_attr_group);
+#ifdef TSL2540_ENABLE_INPUT
+	if (chip->d_idev)
+		input_unregister_device(chip->d_idev);
+#endif /* TSL2540_ENABLE_INPUT */
+#endif /* ABI_SET_GET_REGISTERS */
+
+#ifdef TSL2540_ENABLE_INPUT
+	if (chip->a_idev)
+		input_unregister_device(chip->a_idev);
 	if (chip->p_idev)
 		input_unregister_device(chip->p_idev);
+#endif /* TSL2540_ENABLE_INPUT */
+
+	/* Unwind tsl2540_setup() and the probe-time power state. */
+	AMS_MUTEX_LOCK(&chip->lock);
+	if (chip->als_enabled)
+		tsl2540_configure_als_mode(chip, 0);
+	AMS_MUTEX_UNLOCK(&chip->lock);
+
+	if (!chip->unpowered)
+		tsl2540_pltf_power_off(chip);
+
 	if (chip->pdata->platform_teardown)
-		chip->pdata->platform_teardown(&client->dev);
+		chip->pdata->platform_teardown(dev);
 	i2c_set_clientdata(client, NULL);
 #ifdef CONFIG_OF
-	kfree(chip->pdata);
+	/* Only the DT path allocates its own platform data. */
+	if (chip->pdata != client->dev.platform_data)
+		kfree(chip->pdata);
 #endif
 	kfree(chip);
 }

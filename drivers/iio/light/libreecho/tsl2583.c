@@ -1394,7 +1394,9 @@ static int taos_resume(struct device *dev)
 static void taos_remove(struct i2c_client *client)
 {
 	struct iio_dev *indio_dev = i2c_get_clientdata(client);
+#ifdef CONFIG_ALS_TSL2584_AUTOZERO
 	struct tsl258x_chip *chip = iio_priv(indio_dev);
+#endif
 
 	taos_chip_off(indio_dev);
 #ifdef CONFIG_ALS_TSL2584_AUTOZERO
