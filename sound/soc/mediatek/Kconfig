@@ -365,4 +365,17 @@ config SND_SOC_MT8516
 	  Select Y if you have such device.
 	  If unsure select "N".
 
+config SND_SOC_MT8516_AMAZON_LIDAR
+	tristate "ASoC Audio driver for the MT8516 based Amazon Echo Plus (2nd gen)"
+	depends on SND_SOC_MT8516 && I2C && GPIOLIB
+	select SND_SOC_TLV320ADC3XXX
+	select SND_SOC_TLV320AIC32X4_I2C
+	imply RESET_GPIO
+	help
+	  This adds support for ASoC machine driver for the Amazon Echo
+	  Plus (2nd generation), codename "lidar", with a TLV320AIC32x4
+	  DAC and four TLV320ADC3101 microphone ADCs.
+	  Select Y if you have such device.
+	  If unsure select "N".
+
 endmenu
