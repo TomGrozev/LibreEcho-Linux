@@ -51,6 +51,12 @@ static const struct scpsys_domain_data scpsys_domain_data_mt8167[] = {
 		.sram_pdn_ack_bits = GENMASK(13, 12),
 		.caps = MTK_SCPD_ACTIVE_WAKEUP,
 	},
+	/*
+	 * On Lidar the GPU domains never raise PWR_ACK: 0x60c reports them on
+	 * while 0x610 stays clear, so powering them at probe times out and
+	 * aborts the whole controller.  mt8167.dtsi has no MFG consumer, so
+	 * keep the unused GPU off by default.
+	 */
 	[MT8167_POWER_DOMAIN_MFG_ASYNC] = {
 		.name = "mfg_async",
 		.sta_mask = MT8167_PWR_STATUS_MFG_ASYNC,
@@ -63,6 +69,7 @@ static const struct scpsys_domain_data scpsys_domain_data_mt8167[] = {
 			BUS_PROT_INFRA_UPDATE_TOPAXI(MT8167_TOP_AXI_PROT_EN_MCU_MFG |
 						     MT8167_TOP_AXI_PROT_EN_MFG_EMI),
 		},
+		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
 	},
 	[MT8167_POWER_DOMAIN_MFG_2D] = {
 		.name = "mfg_2d",
@@ -72,6 +79,7 @@ static const struct scpsys_domain_data scpsys_domain_data_mt8167[] = {
 		.pwr_sta2nd_offs = SPM_PWR_STATUS_2ND,
 		.sram_pdn_bits = GENMASK(11, 8),
 		.sram_pdn_ack_bits = GENMASK(15, 12),
+		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
 	},
 	[MT8167_POWER_DOMAIN_MFG] = {
 		.name = "mfg",
@@ -81,6 +89,7 @@ static const struct scpsys_domain_data scpsys_domain_data_mt8167[] = {
 		.pwr_sta2nd_offs = SPM_PWR_STATUS_2ND,
 		.sram_pdn_bits = GENMASK(11, 8),
 		.sram_pdn_ack_bits = GENMASK(15, 12),
+		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
 	},
 	[MT8167_POWER_DOMAIN_CONN] = {
 		.name = "conn",
