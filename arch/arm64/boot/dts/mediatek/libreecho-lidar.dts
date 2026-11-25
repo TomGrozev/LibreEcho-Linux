@@ -1,0 +1,751 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * LibreEcho Lidar - Amazon Echo Plus (2nd generation), MediaTek MT8167
+ *
+ * Board facts below come from the production stock device tree (boot_a.bin
+ * appended FDT index 4, "amzn,lidar-pvt", sha256
+ * b5302d9e4a672e7c2d06624d712746fe61fa30ed59183d85f253cec2775a730f) and the
+ * stock kernel boot log.  Values that are inferred from upstream MT8167/
+ * MT8516 support rather than observed in the stock tree are marked.
+ *
+ * The sound card, the AFE wiring and every codec node live in
+ * libreecho-lidar-audio.dtsi, which this file includes at the end.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/pinctrl/mt65xx.h>
+#include "mt8167.dtsi"
+
+/ {
+	model = "LibreEcho Lidar";
+	/*
+	 * The first two entries are the stock PVT identity: LK scores appended
+	 * DTBs against the idme board_id table, so a replacement DTB must keep
+	 * them to be selected on stock firmware.  "amzn" is not a registered
+	 * vendor prefix and these compatibles have no binding; they stay
+	 * because the stock loader treats them as ABI.
+	 */
+	compatible = "amzn,lidar-pvt", "amzn,lidar", "mediatek,mt8167";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
+		i2c0 = &i2c0;
+		i2c1 = &i2c1;
+		i2c2 = &i2c2;
+		/* SDIO host numbering: the MT7668 combo lands on mmc1. */
+		mmc0 = &mmc0;
+		mmc1 = &mmc2;
+	};
+
+	/*
+	 * The stock tree's memory node says 0x20000000 (512 MiB), but the stock
+	 * boot log reports 259984 pages and a memblock layout running to
+	 * 0x7f9c0000: 1 GiB of DRAM at 0x40000000 minus the TEE carve-out at
+	 * the top.  LK fixes up this node at boot; ending below the carve-out
+	 * keeps the kernel off TEE memory even if a loader passes it unchanged.
+	 */
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0 0x40000000 0 0x3f9c0000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * Inside the window the stock loader's `fetch` command can read,
+		 * and outside every region this boot chain loads into: the
+		 * kernel ends below 0x40950000, the ramdisk starts at
+		 * 0x44000000, and LK's download window runs from 0x44fff000.
+		 * One 0x10000 record, 0x40000 of console and 0x10000 of pmsg.
+		 */
+		ramoops@43810000 {
+			compatible = "ramoops";
+			reg = <0 0x43810000 0 0x60000>;
+			record-size = <0x10000>;
+			console-size = <0x40000>;
+			pmsg-size = <0x10000>;
+		};
+	};
+
+	/*
+	 * The stock BL31 does not grant the kernel access to the PMU
+	 * registers, so the armv8 PMU probe would hang once its driver is
+	 * built in.
+	 */
+	pmu {
+		status = "disabled";
+	};
+
+	/*
+	 * The board has no PMIC: stock leaves pwrap disabled and gives it no
+	 * child.  eMMC power comes from fixed rails (mmc_power 3.3 V,
+	 * mmc_io 1.8 V), the CPU rail is the RT5739 buck on i2c1, and the
+	 * SDIO rail is switched by GPIO24.
+	 */
+	reg_3v3: regulator-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "mmc_power";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	reg_1v8: regulator-1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "mmc_io";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+	wifi_3v3: regulator-wifi-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "wifi_3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&pio 24 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <500000>;
+		/* The vendor driver holds PMU_EN low 5 ms when resetting the chip. */
+		off-on-delay-us = <5000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_pmu_en_pins>;
+	};
+
+	/*
+	 * Hardware-verified button map: volume on GPIO7/GPIO12, action on
+	 * GPIO42 and microphone mute on GPIO108.  The microphone privacy latch
+	 * state on GPIO18 is owned by amz_privacy below, not by gpio-keys.
+	 * GPIO108 is active high with its pull disabled (bias-disable).
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&gpio_keys_pins>, <&board_hog_pins>;
+
+		key-volume-up {
+			label = "volume_up";
+			gpios = <&pio 7 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+			debounce-interval = <50>;
+			wakeup-source;
+		};
+
+		key-volume-down {
+			label = "volume_down";
+			gpios = <&pio 12 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEDOWN>;
+			debounce-interval = <50>;
+			wakeup-source;
+		};
+
+		key-action {
+			label = "action";
+			gpios = <&pio 42 GPIO_ACTIVE_LOW>;
+			/* Stock 0x8a: KEY_HELP, not KEY_PROPS. */
+			linux,code = <KEY_HELP>;
+			debounce-interval = <50>;
+			wakeup-source;
+		};
+
+		key-mic-mute {
+			label = "mic_mute";
+			gpios = <&pio 108 GPIO_ACTIVE_HIGH>;
+			linux,code = <KEY_MICMUTE>;
+			debounce-interval = <50>;
+			wakeup-source;
+		};
+	};
+
+	/*
+	 * The mute button drives a hardware latch that cuts the microphones.
+	 * The latched state is a read-only line: the driver reports it through
+	 * its privacy_state attribute and cannot drive it from software.
+	 */
+	amz_privacy {
+		compatible = "amazon,amz-privacy";
+		pinctrl-names = "default";
+		pinctrl-0 = <&privacy_state_pins>;
+		privacy-state-gpios = <&pio 18 GPIO_ACTIVE_HIGH>;
+	};
+
+	thermal-zones {
+		/*
+		 * Stock (production DTB, "amzn,lidar-pvt", appended FDT 4)
+		 * runs its skin/case policy off virtual sensors built from
+		 * these same board thermistors: passive at 55/57/58/59 C and
+		 * critical at 60 C, mapped onto the CPU cooling device.  The
+		 * Amazon virtual-sensor and thermal_cooler drivers have no
+		 * mainline counterpart, so the tmp112 (the board sensor that
+		 * stock feeds into its high-CPU and ambient models) carries
+		 * the same thresholds directly.  The 55 C step allowed no
+		 * frequency reduction downstream (cooling state 0), so it is
+		 * a notification ("hot") here; the three steps that did
+		 * throttle map onto cpufreq cooling states 0-3.
+		 */
+		board-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <1000>;
+			thermal-sensors = <&tmp112>;
+
+			trips {
+				board_hot: board-hot {
+					temperature = <55000>;
+					hysteresis = <500>;
+					type = "hot";
+				};
+
+				board_passive0: board-passive0 {
+					temperature = <57000>;
+					hysteresis = <500>;
+					type = "passive";
+				};
+
+				board_passive1: board-passive1 {
+					temperature = <58000>;
+					hysteresis = <500>;
+					type = "passive";
+				};
+
+				board_passive2: board-passive2 {
+					temperature = <59000>;
+					hysteresis = <500>;
+					type = "passive";
+				};
+
+				board_critical: board-critical {
+					temperature = <60000>;
+					hysteresis = <500>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&board_passive0>;
+					cooling-device = <&cpu0 0 1>;
+				};
+
+				map1 {
+					trip = <&board_passive1>;
+					cooling-device = <&cpu0 1 2>;
+				};
+
+				map2 {
+					trip = <&board_passive2>;
+					cooling-device = <&cpu0 2 3>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * The stock console is uart0 at 0x11005000 ("serial0"), but its node stays
+ * disabled: with no console attached the serial core powers the port down,
+ * and mtk8250_runtime_suspend() polls MTK_UART_DEBUG0 without a bound.  After
+ * LK that register never reads zero, so probe would never return.  Console
+ * output, when wanted, has to come from the kernel command line.
+ */
+&cpu0 {
+	/delete-property/ cpu-idle-states;
+	proc-supply = <&vproc>;
+	#cooling-cells = <2>;
+};
+
+/*
+ * Stock idles in plain WFI.  The inherited CLUSTER_SLEEP_0 PSCI state is
+ * unproven against the stock BL31, so a build with CPU_IDLE must not enter it.
+ */
+&cpu1 {
+	/delete-property/ cpu-idle-states;
+	proc-supply = <&vproc>;
+};
+
+&cpu2 {
+	/delete-property/ cpu-idle-states;
+	proc-supply = <&vproc>;
+};
+
+&cpu3 {
+	/delete-property/ cpu-idle-states;
+	proc-supply = <&vproc>;
+};
+
+/*
+ * i2c0: light sensor, IS31FL3236A light-ring controller and a temperature
+ * sensor.
+ */
+&i2c0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c0_pins>;
+	status = "okay";
+
+	/*
+	 * Behind the top cover; the vendor DT does not wire up its interrupt.
+	 * The vendor driver refuses to probe without als_name, and it takes
+	 * every calibration value from DT once platform data exists (with no
+	 * properties its default branch never runs), so the coefficients come
+	 * from the stock PVT node, as does the device name.  boot-on is the
+	 * driver's existing switch for enabling ALS in probe; without it the
+	 * chip stays powered down and als_lux reads 0 forever.
+	 */
+	light-sensor@39 {
+		compatible = "amstaos,tsl2540";
+		reg = <0x39>;
+		als_name = "taos_als";
+		boot-on;
+		persist = <0x12>;
+		als_gain = <0x03>;
+		als_gain_factor = <0x01>;
+		als_deltap = <0x0a>;
+		als_time = <0x7b>;
+		d_factor = <0x51342>;
+		ch0_coef0 = <0x3e8>;
+		ch1_coef0 = <0xf1>;
+		ch0_coef1 = <0x40b>;
+		ch1_coef1 = <0x131>;
+		az_iterations = <0x7e>;
+		als_can_wake = <0x00>;
+	};
+
+	/*
+	 * The A variant has the PWM frequency register (0x4b); the default
+	 * 3 kHz PWM is audible through the speaker.  Channel offset and the
+	 * boot animation flag match the stock tree; the driver has no
+	 * enable-gpio property, so the shutdown bar is driven high by its
+	 * pinctrl state.
+	 */
+	led-controller@3f {
+		compatible = "issi,is31fl3236a";
+		reg = <0x3f>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&led_sdb_pins>;
+		issi,22khz-pwm;
+		channel-offset = /bits/ 8 <3>;
+		play-boot-animation;
+
+		/*
+		 * Twelve RGB LEDs: LED n uses channels 3n-2 (red),
+		 * 3n-1 (green) and 3n (blue).
+		 */
+		led@1 { reg = <1>; label = "ring1:red"; };
+		led@2 { reg = <2>; label = "ring1:green"; };
+		led@3 { reg = <3>; label = "ring1:blue"; };
+		led@4 { reg = <4>; label = "ring2:red"; };
+		led@5 { reg = <5>; label = "ring2:green"; };
+		led@6 { reg = <6>; label = "ring2:blue"; };
+		led@7 { reg = <7>; label = "ring3:red"; };
+		led@8 { reg = <8>; label = "ring3:green"; };
+		led@9 { reg = <9>; label = "ring3:blue"; };
+		led@a { reg = <10>; label = "ring4:red"; };
+		led@b { reg = <11>; label = "ring4:green"; };
+		led@c { reg = <12>; label = "ring4:blue"; };
+		led@d { reg = <13>; label = "ring5:red"; };
+		led@e { reg = <14>; label = "ring5:green"; };
+		led@f { reg = <15>; label = "ring5:blue"; };
+		led@10 { reg = <16>; label = "ring6:red"; };
+		led@11 { reg = <17>; label = "ring6:green"; };
+		led@12 { reg = <18>; label = "ring6:blue"; };
+		led@13 { reg = <19>; label = "ring7:red"; };
+		led@14 { reg = <20>; label = "ring7:green"; };
+		led@15 { reg = <21>; label = "ring7:blue"; };
+		led@16 { reg = <22>; label = "ring8:red"; };
+		led@17 { reg = <23>; label = "ring8:green"; };
+		led@18 { reg = <24>; label = "ring8:blue"; };
+		led@19 { reg = <25>; label = "ring9:red"; };
+		led@1a { reg = <26>; label = "ring9:green"; };
+		led@1b { reg = <27>; label = "ring9:blue"; };
+		led@1c { reg = <28>; label = "ring10:red"; };
+		led@1d { reg = <29>; label = "ring10:green"; };
+		led@1e { reg = <30>; label = "ring10:blue"; };
+		led@1f { reg = <31>; label = "ring11:red"; };
+		led@20 { reg = <32>; label = "ring11:green"; };
+		led@21 { reg = <33>; label = "ring11:blue"; };
+		led@22 { reg = <34>; label = "ring12:red"; };
+		led@23 { reg = <35>; label = "ring12:green"; };
+		led@24 { reg = <36>; label = "ring12:blue"; };
+	};
+
+	temperature-sensor@48 {
+		compatible = "ti,tmp108";
+		reg = <0x48>;
+		#thermal-sensor-cells = <0>;
+	};
+};
+
+/*
+ * CPU rail: Richtek RT5739 buck at 0x57.  Measured on a PVT unit: ID1/ID2
+ * read 0 (RT5739, 300-1300 mV, 5 mV steps), both banks hold 0xaa
+ * (1.150 V), and VSEL (GPIO9) is an input pulled high, so the active bank is
+ * NSEL1.  GPIO9 is left untouched.
+ */
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c1_pins>;
+	status = "okay";
+
+	vproc: regulator@57 {
+		compatible = "richtek,rt5739";
+		reg = <0x57>;
+		regulator-name = "vproc";
+		regulator-min-microvolt = <1150000>;
+		regulator-max-microvolt = <1300000>;
+		regulator-always-on;
+		regulator-boot-on;
+		richtek,vsel-active-high;
+	};
+};
+
+/* i2c2: digipot and the two board temperature sensors. */
+&i2c2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c2_pins>;
+	status = "okay";
+
+	digipot@2e {
+		compatible = "microchip,mcp4631-503";
+		reg = <0x2e>;
+	};
+
+	tmp112: temperature-sensor@48 {
+		compatible = "ti,tmp112";
+		reg = <0x48>;
+		#thermal-sensor-cells = <0>;
+	};
+
+	temperature-sensor@4a {
+		compatible = "ti,tmp108";
+		reg = <0x4a>;
+		#thermal-sensor-cells = <0>;
+	};
+};
+
+&mmc0 {
+	bus-width = <8>;
+	max-frequency = <200000000>;
+	non-removable;
+	cap-mmc-highspeed;
+	mmc-hs200-1_8v;
+	cap-mmc-hw-reset;
+	vmmc-supply = <&reg_3v3>;
+	vqmmc-supply = <&reg_1v8>;
+	pinctrl-names = "default", "state_uhs";
+	pinctrl-0 = <&mmc0_pins_default>;
+	pinctrl-1 = <&mmc0_pins_uhs>;
+	status = "okay";
+};
+
+/*
+ * MSDC2 carries the MT7668 Wi-Fi/Bluetooth combo as a non-removable SDIO
+ * card (function 1 WLAN, function 2 Bluetooth).  The pads are fixed 1.8 V,
+ * so no vqmmc is described; the 3.3 V rail is switched by GPIO24.
+ */
+&mmc2 {
+	/* mtk-sd fails the probe without a "state_uhs" pinctrl state. */
+	pinctrl-names = "default", "state_uhs";
+	pinctrl-0 = <&mmc2_pins_default>;
+	pinctrl-1 = <&mmc2_pins_default>;
+	bus-width = <4>;
+	max-frequency = <200000000>;
+	cap-sd-highspeed;
+	sd-uhs-sdr50;
+	sd-uhs-sdr104;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	wakeup-source;
+	non-removable;
+	no-sd;
+	no-mmc;
+	vmmc-supply = <&wifi_3v3>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	/* SDIO function 1 = WLAN (037a:7608), function 2 = Bluetooth (btmtksdio). */
+	wifi: wifi@1 {
+		reg = <1>;
+	};
+};
+
+&pio {
+	/*
+	 * Board-level line defaults.  They are applied through the gpio-keys
+	 * and LED controller pinctrl states and the lines stay unclaimed, so
+	 * userspace can drive them (e.g. EFR32_SWCLK, the EFR32 bootloader
+	 * trigger: low keeps the radio in its bootloader after a reset).
+	 */
+	gpio-line-names =
+		/*  0 */ "", "EFR32_SWCLK", "MIC_ADC_EN", "", "LED_SDB",
+		/*  5 */ "", "", "KEY_VOL_UP", "", "VPROC_VSEL",
+		/* 10 */ "DAC_RESET", "", "KEY_VOL_DOWN", "EFR32_RESET_N", "",
+		/* 15 */ "", "", "", "MIC_PRIVACY_STATE", "",
+		/* 20 */ "", "", "", "EFR32_PTI_FRAME", "WIFI_PMU_EN";
+
+	board_hog_pins: board-hog-pins {
+		pins-efr32-run {
+			/* EFR32 out of reset, SWD clock idle low (stock rfkill defaults). */
+			pinmux = <MT8167_PIN_13_EINT13__FUNC_GPIO13>;
+			output-high;
+		};
+
+		pins-efr32-swclk {
+			pinmux = <MT8167_PIN_1_EINT1__FUNC_GPIO1>;
+			output-low;
+		};
+
+		pins-privacy-enable {
+			/*
+			 * GPIO107 (active low) lets software force privacy mode
+			 * on; keep it released.
+			 */
+			pinmux = <MT8167_PIN_107_MSDC1_DAT1__FUNC_GPIO107>;
+			output-high;
+		};
+	};
+
+	led_sdb_pins: led-sdb-pins {
+		pins-sdb {
+			/* IS31FL3236 SDB: low is hardware shutdown. */
+			pinmux = <MT8167_PIN_4_EINT4__FUNC_GPIO4>;
+			output-high;
+		};
+	};
+
+	gpio_keys_pins: gpio-keys-pins {
+		pins-keys {
+			pinmux = <MT8167_PIN_7_EINT7__FUNC_GPIO7>,
+				 <MT8167_PIN_12_EINT12__FUNC_GPIO12>,
+				 <MT8167_PIN_42_KPCOL0__FUNC_GPIO42>;
+			bias-pull-up;
+			input-enable;
+		};
+
+		/* Active high, pull disabled: the button drives the line. */
+		pins-mic-mute {
+			pinmux = <MT8167_PIN_108_MSDC1_DAT2__FUNC_GPIO108>;
+			bias-disable;
+			input-enable;
+		};
+	};
+
+	privacy_state_pins: privacy-state-pins {
+		pins-privacy-state {
+			pinmux = <MT8167_PIN_18_EINT18__FUNC_GPIO18>;
+			bias-disable;
+			input-enable;
+		};
+	};
+
+	i2c0_pins: i2c0-pins {
+		pins-bus {
+			pinmux = <MT8167_PIN_58_SDA0__FUNC_SDA0_0>,
+				 <MT8167_PIN_59_SCL0__FUNC_SCL0_0>;
+			bias-disable;
+		};
+	};
+
+	i2c1_pins: i2c1-pins {
+		pins-bus {
+			pinmux = <MT8167_PIN_52_SDA1__FUNC_SDA1_0>,
+				 <MT8167_PIN_53_SCL1__FUNC_SCL1_0>;
+			bias-disable;
+		};
+	};
+
+	i2c2_pins: i2c2-pins {
+		pins-bus {
+			pinmux = <MT8167_PIN_60_SDA2__FUNC_SDA2_0>,
+				 <MT8167_PIN_61_SCL2__FUNC_SCL2_0>;
+			bias-disable;
+		};
+	};
+
+	mmc0_pins_default: mmc0-pins-default-0 {
+		pins-cmd-dat {
+			pinmux = <MT8167_PIN_120_MSDC0_DAT0__FUNC_MSDC0_DAT0>,
+				 <MT8167_PIN_119_MSDC0_DAT1__FUNC_MSDC0_DAT1>,
+				 <MT8167_PIN_118_MSDC0_DAT2__FUNC_MSDC0_DAT2>,
+				 <MT8167_PIN_117_MSDC0_DAT3__FUNC_MSDC0_DAT3>,
+				 <MT8167_PIN_113_MSDC0_DAT4__FUNC_MSDC0_DAT4>,
+				 <MT8167_PIN_112_MSDC0_DAT5__FUNC_MSDC0_DAT5>,
+				 <MT8167_PIN_111_MSDC0_DAT6__FUNC_MSDC0_DAT6>,
+				 <MT8167_PIN_110_MSDC0_DAT7__FUNC_MSDC0_DAT7>,
+				 <MT8167_PIN_115_MSDC0_CMD__FUNC_MSDC0_CMD>;
+			input-enable;
+			bias-pull-up;
+		};
+
+		pins-clk {
+			pinmux = <MT8167_PIN_116_MSDC0_CLK__FUNC_MSDC0_CLK>;
+			bias-pull-down;
+		};
+
+		pins-rst {
+			pinmux = <MT8167_PIN_114_MSDC0_RSTB__FUNC_MSDC0_RSTB>;
+			bias-pull-up;
+		};
+	};
+
+	mmc0_pins_uhs: mmc0-pins-uhs-1 {
+		pins-cmd-dat {
+			pinmux = <MT8167_PIN_120_MSDC0_DAT0__FUNC_MSDC0_DAT0>,
+				 <MT8167_PIN_119_MSDC0_DAT1__FUNC_MSDC0_DAT1>,
+				 <MT8167_PIN_118_MSDC0_DAT2__FUNC_MSDC0_DAT2>,
+				 <MT8167_PIN_117_MSDC0_DAT3__FUNC_MSDC0_DAT3>,
+				 <MT8167_PIN_113_MSDC0_DAT4__FUNC_MSDC0_DAT4>,
+				 <MT8167_PIN_112_MSDC0_DAT5__FUNC_MSDC0_DAT5>,
+				 <MT8167_PIN_111_MSDC0_DAT6__FUNC_MSDC0_DAT6>,
+				 <MT8167_PIN_110_MSDC0_DAT7__FUNC_MSDC0_DAT7>,
+				 <MT8167_PIN_115_MSDC0_CMD__FUNC_MSDC0_CMD>;
+			input-enable;
+			drive-strength = <MTK_DRIVE_6mA>;
+			bias-pull-up = <MTK_PUPD_SET_R1R0_01>;
+		};
+
+		pins-clk {
+			pinmux = <MT8167_PIN_116_MSDC0_CLK__FUNC_MSDC0_CLK>;
+			drive-strength = <MTK_DRIVE_8mA>;
+			bias-pull-down = <MTK_PUPD_SET_R1R0_10>;
+		};
+
+		pins-rst {
+			pinmux = <MT8167_PIN_114_MSDC0_RSTB__FUNC_MSDC0_RSTB>;
+			bias-pull-up;
+		};
+	};
+
+	mmc2_pins_default: mmc2-pins-default {
+		pins-cmd-dat {
+			pinmux = <MT8167_PIN_68_MSDC2_CMD__FUNC_MSDC2_CMD>,
+				 <MT8167_PIN_70_MSDC2_DAT0__FUNC_MSDC2_DAT0>,
+				 <MT8167_PIN_71_MSDC2_DAT1__FUNC_MSDC2_DAT1>,
+				 <MT8167_PIN_72_MSDC2_DAT2__FUNC_MSDC2_DAT2>,
+				 <MT8167_PIN_73_MSDC2_DAT3__FUNC_MSDC2_DAT3>;
+			input-enable;
+			drive-strength = <MTK_DRIVE_8mA>;
+			bias-pull-up = <MTK_PUPD_SET_R1R0_10>;
+		};
+
+		pins-clk {
+			pinmux = <MT8167_PIN_69_MSDC2_CLK__FUNC_MSDC2_CLK>;
+			drive-strength = <MTK_DRIVE_8mA>;
+			bias-pull-down = <MTK_PUPD_SET_R1R0_10>;
+		};
+	};
+
+	uart1_pins: uart1-pins {
+		pins-rx {
+			pinmux = <MT8167_PIN_64_URXD1__FUNC_URXD1>;
+			bias-pull-up;
+		};
+
+		pins-tx {
+			pinmux = <MT8167_PIN_65_UTXD1__FUNC_UTXD1>;
+		};
+	};
+
+	uart2_pins: uart2-pins {
+		pins-rx {
+			pinmux = <MT8167_PIN_34_URXD2__FUNC_URXD2>;
+			bias-pull-up;
+		};
+
+		pins-tx {
+			pinmux = <MT8167_PIN_35_UTXD2__FUNC_UTXD2>;
+		};
+
+		pins-flow {
+			pinmux = <MT8167_PIN_5_EINT5__FUNC_UCTS2>,
+				 <MT8167_PIN_6_EINT6__FUNC_URTS2>;
+		};
+	};
+
+	wifi_pmu_en_pins: wifi-pmu-en-pins {
+		pins-pmu-en {
+			pinmux = <MT8167_PIN_24_EINT24__FUNC_GPIO24>;
+			bias-disable;
+		};
+	};
+};
+
+/*
+ * The board has no PMIC.  Stock leaves pwrap disabled and gives it no child;
+ * keep that, since the real rails are described above and on i2c1.
+ */
+&pwrap {
+	status = "disabled";
+};
+
+/*
+ * Software reboot to fastboot.  Stock LK enters fastboot when bit 2 of the
+ * TOPRGU WDT_NONRST2 register at 0x10007024 survives a watchdog reset.  The
+ * reboot-mode notifier writes that bit before the restart chain runs, so user
+ * space only needs reboot(LINUX_REBOOT_CMD_RESTART2, "bootloader") and does
+ * not touch misc.
+ *
+ * syscon-reboot-mode takes its regmap from the parent node, and that lookup
+ * requires the parent to be compatible "syscon".  The child only becomes a
+ * platform device because of_platform_populate() walks children of
+ * "simple-mfd" nodes (of_default_bus_match_table).  Both compatibles come
+ * after the watchdog ones so mtk_wdt still binds.
+ */
+&toprgu {
+	compatible = "mediatek,mt8516-wdt", "mediatek,mt6589-wdt",
+		     "syscon", "simple-mfd";
+
+	reboot-mode {
+		compatible = "syscon-reboot-mode";
+		offset = <0x24>;
+		mask = <0x4>;
+		mode-bootloader = <0x4>;
+	};
+};
+
+/* Silicon Labs EFR32 radio: packet trace (PTI) output, as stock's zigbee_pti. */
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1_pins>;
+	status = "okay";
+};
+
+/*
+ * Silicon Labs EFR32 radio: host interface for its Gecko bootloader and the
+ * NCP/RCP application, 115200 8N1.  RTS/CTS are wired, but the bootloader
+ * never drives CTS, so the port is left without uart-has-rtscts and the
+ * radio tools open it with crtscts off.  Enabling hardware flow control
+ * would make the 8250 driver hold transmit until CTS asserts, and the radio
+ * bootloader menu never asserts it.
+ */
+&uart2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart2_pins>;
+	status = "okay";
+};
+
+/*
+ * USB device port on the in-SoC MUSB controller.  Stock uses
+ * "mediatek,mt8167-usb20" with 8-bit FIFOs and OTG; this bring-up keeps the
+ * inherited mt8516 compatibles so the stock upstream mtk-musb glue binds,
+ * in a peripheral role.
+ */
+&usb0 {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&usb_phy {
+	status = "okay";
+};
+
+#include "libreecho-lidar-audio.dtsi"
