@@ -37,11 +37,15 @@ properties:
 
   reset-gpios:
     maxItems: 1
-    description: GPIO pin used for codec reset (RESET pin)
+    description:
+      GPIO pin used for codec reset (RESET pin). Several codecs may refer to
+      the same GPIO if their RESET pins are wired together.
 
   clocks:
     maxItems: 1
-    description: Master clock (MCLK)
+    description:
+      Master clock (MCLK). If there is no master clock, the codec is clocked
+      from the bit clock (BCLK) and can only operate as clock consumer.
 
   ti,dmdin-gpio1:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -131,7 +135,6 @@ dependencies:
 required:
   - compatible
   - reg
-  - clocks
 
 unevaluatedProperties: false
 
