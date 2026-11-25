@@ -523,7 +523,7 @@ static int mtk8250_probe(struct platform_device *pdev)
 	struct uart_8250_port uart = {};
 	struct mtk8250_data *data;
 	struct resource *regs;
-	int irq, err;
+	int irq, err, line;
 
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
@@ -571,6 +571,14 @@ static int mtk8250_probe(struct platform_device *pdev)
 	if (data->dma)
 		uart.dma = data->dma;
 #endif
+
+	/*
+	 * Number the port from its "serialN" alias so the ttyS number matches
+	 * the board wiring instead of the platform-device probe order.
+	 */
+	line = of_alias_get_id(pdev->dev.of_node, "serial");
+	if (line >= 0)
+		uart.port.line = line;
 
 	/* Disable Rate Fix function */
 	writel(0x0, uart.port.membase +
