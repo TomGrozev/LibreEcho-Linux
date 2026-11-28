@@ -899,6 +899,8 @@ patternProperties:
     description: LG Corporation
   "^lgphilips,.*":
     description: LG Display
+  "^libreecho,.*":
+    description: LibreEcho
   "^libretech,.*":
     description: Shenzhen Libre Technology Co., Ltd
   "^licheepi,.*":

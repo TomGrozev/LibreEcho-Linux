@@ -872,9 +872,21 @@ static const struct mtk_clk_desc topck_desc = {
 	.clk_lock = &mt8167_clk_lock,
 };
 
+/* INFRA_RST0: set (assert) at 0x30, clear (deassert) at 0x34 */
+static u16 infra_rst_ofs[] = {
+	0x30,
+};
+
+static const struct mtk_clk_rst_desc infra_rst_desc = {
+	.version = MTK_RST_SET_CLR,
+	.rst_bank_ofs = infra_rst_ofs,
+	.rst_bank_nr = ARRAY_SIZE(infra_rst_ofs),
+};
+
 static const struct mtk_clk_desc infra_desc = {
 	.composite_clks = ifr_muxes,
 	.num_composite_clks = ARRAY_SIZE(ifr_muxes),
+	.rst_desc = &infra_rst_desc,
 	.clk_lock = &mt8167_clk_lock,
 };
 

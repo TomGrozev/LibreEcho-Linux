@@ -22,6 +22,7 @@ properties:
   compatible:
     enum:
       - richtek,rt5733
+      - richtek,rt5738
       - richtek,rt5739
 
   reg:

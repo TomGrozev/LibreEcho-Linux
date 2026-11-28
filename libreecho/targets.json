@@ -1,10 +1,20 @@
 {
   "radar_puffin": {
+    "arch": "arm",
     "defconfig": "mt8163_arm32_defconfig",
-    "dtb": "mediatek/libreecho-radar-puffin.dtb"
+    "dtb": "mediatek/libreecho-radar-puffin.dtb",
+    "image": "zImage"
   },
   "biscuit": {
+    "arch": "arm",
     "defconfig": "mt8163_arm32_defconfig",
-    "dtb": "mediatek/libreecho-radar-puffin.dtb"
+    "dtb": "mediatek/libreecho-radar-puffin.dtb",
+    "image": "zImage"
+  },
+  "lidar": {
+    "arch": "arm64",
+    "defconfig": "mt8167_arm64_defconfig",
+    "dtb": "mediatek/libreecho-lidar.dtb",
+    "image": "Image"
   }
 }

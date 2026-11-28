@@ -202,7 +202,7 @@
 			#clock-cells = <1>;
 		};
 
-		watchdog@10007000 {
+		toprgu: watchdog@10007000 {
 			compatible = "mediatek,mt8516-wdt",
 				     "mediatek,mt6589-wdt";
 			reg = <0 0x10007000 0 0x1000>;
@@ -430,14 +430,89 @@
 			status = "disabled";
 		};
 
+		afe: audio-controller@11140000 {
+			compatible = "mediatek,mt8516-afe-pcm";
+			reg = <0 0x11140000 0 0x1000>;
+			interrupts = <GIC_SPI 120 IRQ_TYPE_LEVEL_LOW>;
+			clocks = <&topckgen CLK_TOP_AUDIO>,
+				 <&topckgen CLK_TOP_RG_AUD1>,
+				 <&topckgen CLK_TOP_RG_AUD2>,
+				 <&topckgen CLK_TOP_RG_AUD_ENGEN1>,
+				 <&topckgen CLK_TOP_RG_AUD_ENGEN2>,
+				 <&topckgen CLK_TOP_AUD_I2S0_M_SEL>,
+				 <&topckgen CLK_TOP_AUD_I2S1_M_SEL>,
+				 <&topckgen CLK_TOP_AUD_I2S2_M_SEL>,
+				 <&topckgen CLK_TOP_AUD_I2S3_M_SEL>,
+				 <&topckgen CLK_TOP_AUD_I2S4_M_SEL>,
+				 <&topckgen CLK_TOP_AUD_I2S5_M_SEL>,
+				 <&topckgen CLK_TOP_APLL12_DIV0>,
+				 <&topckgen CLK_TOP_APLL12_DIV1>,
+				 <&topckgen CLK_TOP_APLL12_DIV2>,
+				 <&topckgen CLK_TOP_APLL12_DIV3>,
+				 <&topckgen CLK_TOP_APLL12_DIV4>,
+				 <&topckgen CLK_TOP_APLL12_DIV4B>,
+				 <&topckgen CLK_TOP_APLL12_DIV5>,
+				 <&topckgen CLK_TOP_APLL12_DIV5B>;
+			clock-names = "top_pdn_audio",
+				      "aud1",
+				      "aud2",
+				      "engen1",
+				      "engen2",
+				      "i2s0_m_sel",
+				      "i2s1_m_sel",
+				      "i2s2_m_sel",
+				      "i2s3_m_sel",
+				      "i2s4_m_sel",
+				      "i2s5_m_sel",
+				      "apll12_div0",
+				      "apll12_div1",
+				      "apll12_div2",
+				      "apll12_div3",
+				      "apll12_div4",
+				      "apll12_div4b",
+				      "apll12_div5",
+				      "apll12_div5b";
+			/*
+			 * APLL1 serves the 44.1 kHz sample rate family (8 x
+			 * 22.5792 MHz), APLL2 the 48 kHz family (8 x 24.576 MHz).
+			 */
+			assigned-clocks = <&apmixedsys CLK_APMIXED_APLL1>,
+					  <&apmixedsys CLK_APMIXED_APLL2>,
+					  <&topckgen CLK_TOP_AUD1_SEL>,
+					  <&topckgen CLK_TOP_AUD2_SEL>,
+					  <&topckgen CLK_TOP_AUD_ENGEN1_SEL>,
+					  <&topckgen CLK_TOP_AUD_ENGEN2_SEL>;
+			assigned-clock-parents = <0>, <0>,
+						 <&topckgen CLK_TOP_APLL1>,
+						 <&topckgen CLK_TOP_APLL2>,
+						 <&topckgen CLK_TOP_RG_APLL1_D8_EN>,
+						 <&topckgen CLK_TOP_RG_APLL2_D8_EN>;
+			assigned-clock-rates = <180633600>, <196608000>;
+			status = "disabled";
+		};
+
 		mmc2: mmc@11170000 {
 			compatible = "mediatek,mt8516-mmc";
 			reg = <0 0x11170000 0 0x1000>;
 			interrupts = <GIC_SPI 109 IRQ_TYPE_LEVEL_LOW>;
-			clocks = <&topckgen CLK_TOP_MSDC2>,
-				 <&topckgen CLK_TOP_RG_MSDC2>,
+			/*
+			 * msdc2 is only the AHB bus gate; the functional clock
+			 * is rg_msdc2 (msdc2_sel). With them swapped the bus
+			 * gate is never enabled and the probe spins forever
+			 * waiting for MSDC_CFG_CKSTB.
+			 */
+			clocks = <&topckgen CLK_TOP_RG_MSDC2>,
+				 <&topckgen CLK_TOP_MSDC2>,
 				 <&topckgen CLK_TOP_MSDC2_INFRA>;
 			clock-names = "source", "hclk", "source_cg";
+			/*
+			 * INFRA_RST0 bit 23. The controller stays in reset
+			 * unless a previous stage used it, and every register
+			 * then reads back 0 (the stock driver pulses this in
+			 * probe).
+			 */
+			resets = <&infracfg 23>;
+			reset-names = "hrst";
 			status = "disabled";
 		};
 

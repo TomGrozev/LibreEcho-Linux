@@ -34,6 +34,24 @@
 
 #include "tlv320aic32x4.h"
 
+/*
+ * The codec's own clocks (registered by aic32x4_register_clocks()), held
+ * for the lifetime of the component. MADC, MDAC and BDIV must stay last and
+ * in this order: they are switched together with the bias level.
+ */
+enum {
+	AIC32X4_CLK_CODEC_CLKIN,
+	AIC32X4_CLK_PLL,
+	AIC32X4_CLK_NADC,
+	AIC32X4_CLK_NDAC,
+	AIC32X4_CLK_MADC,
+	AIC32X4_CLK_MDAC,
+	AIC32X4_CLK_BDIV,
+	AIC32X4_NUM_CLKS,
+};
+
+#define AIC32X4_NUM_BIAS_CLKS	(AIC32X4_NUM_CLKS - AIC32X4_CLK_MADC)
+
 struct aic32x4_priv {
 	struct regmap *regmap;
 	struct snd_soc_component *component;
@@ -57,13 +75,150 @@ struct aic32x4_priv {
 	bool playback_mono;
 	bool playback_active;
 	struct mutex diag_lock;
+
+	/* DAC biquads A-C, left then right (AIC32X4_BIQUAD_BYTES) */
+	u8 dac_biquads[AIC32X4_BIQUAD_BYTES];
+	/* Both DACs play (L+R)/2 */
+	bool dac_mix;
+	/* Mono playback feeds the left serial slot to both DACs (Lidar) */
+	bool mono_left;
+	/* Channels of the current playback stream */
+	unsigned int dac_channels;
+
+	struct clk_bulk_data clks[AIC32X4_NUM_CLKS];
 };
+
+/*
+ * The coefficient RAM can only be written while the DACs are powered down:
+ * the stored coefficients are written right away if both DACs are off, and
+ * again whenever a DAC powers up from that state.
+ */
+static bool aic32x4_dacs_off(struct snd_soc_component *component)
+{
+	return !(snd_soc_component_read(component, AIC32X4_DACSETUP) &
+		 (BIT(7) | BIT(6)));
+}
+
+static void aic32x4_write_biquads(struct snd_soc_component *component)
+{
+	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
+	const u8 *c = aic32x4->dac_biquads;
+	int ch, i, b;
+
+	for (ch = 0; ch < 2; ch++) {
+		unsigned int base = ch ? AIC32X4_RDAC_BIQUAD_A : AIC32X4_LDAC_BIQUAD_A;
+
+		for (i = 0; i < AIC32X4_BIQUAD_COEFS; i++)
+			for (b = 0; b < 3; b++)
+				snd_soc_component_write(component, base + 4 * i + b, *c++);
+	}
+}
+
+/*
+ * DAPM runs the PRE_PMU event of both DAC widgets before it powers either
+ * one up, so both events see the DACs off and the coefficients are written
+ * twice when playback starts.
+ */
+static int aic32x4_dac_event(struct snd_soc_dapm_widget *w,
+			     struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+
+	if (event == SND_SOC_DAPM_PRE_PMU && aic32x4_dacs_off(component))
+		aic32x4_write_biquads(component);
+
+	return 0;
+}
+
+static int aic32x4_biquads_get(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
+
+	memcpy(ucontrol->value.bytes.data, aic32x4->dac_biquads,
+	       AIC32X4_BIQUAD_BYTES);
+
+	return 0;
+}
+
+static int aic32x4_biquads_put(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
+	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
+	int changed = 0;
+
+	/* Serialised with DAPM, which powers the DACs and replays the RAM */
+	snd_soc_dapm_mutex_lock(dapm);
+	if (memcmp(aic32x4->dac_biquads, ucontrol->value.bytes.data,
+		   AIC32X4_BIQUAD_BYTES)) {
+		memcpy(aic32x4->dac_biquads, ucontrol->value.bytes.data,
+		       AIC32X4_BIQUAD_BYTES);
+		if (aic32x4_dacs_off(component))
+			aic32x4_write_biquads(component);
+		changed = 1;
+	}
+	snd_soc_dapm_mutex_unlock(dapm);
+
+	return changed;
+}
+
+static unsigned int aic32x4_dac_chan(struct aic32x4_priv *aic32x4)
+{
+	if (aic32x4->dac_channels == 1) {
+		if (aic32x4->mono_left)
+			return AIC32X4_RDAC2LCHN | AIC32X4_LDAC2LCHN;
+		return AIC32X4_RDAC2RCHN | AIC32X4_LDAC2RCHN;
+	}
+	if (aic32x4->dac_mix)
+		return AIC32X4_DAC_CHAN_MASK;
+	if (aic32x4->swapdacs)
+		return AIC32X4_RDAC2LCHN | AIC32X4_LDAC2RCHN;
+	return AIC32X4_LDAC2LCHN | AIC32X4_RDAC2RCHN;
+}
+
+static int aic32x4_dac_mix_get(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
+
+	ucontrol->value.integer.value[0] = aic32x4->dac_mix;
+
+	return 0;
+}
+
+static int aic32x4_dac_mix_put(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
+	bool mix = ucontrol->value.integer.value[0];
+
+	if (mix == aic32x4->dac_mix)
+		return 0;
+
+	aic32x4->dac_mix = mix;
+	snd_soc_component_update_bits(component, AIC32X4_DACSETUP,
+				      AIC32X4_DAC_CHAN_MASK,
+				      aic32x4_dac_chan(aic32x4));
+
+	return 1;
+}
 
 #define AIC32X4_GAIN_APPLIED		AIC32X4_REG(1, 63)
 #define AIC32X4_GAIN_APPLIED_POLL_MS	100
 #define AIC32X4_GAIN_APPLIED_RETRIES	22
-#define AIC32X4_GAIN_APPLIED_MONO	BIT(6)
-#define AIC32X4_GAIN_APPLIED_STEREO	(BIT(7) | BIT(6))
+/*
+ * P1_R63 gain flags follow the P1_R9 output-driver bits (SLAA557 5.3.7,
+ * 5.3.37).  Only the headphone drivers have a startup ramp (P1_R20).
+ */
+#define AIC32X4_GAIN_APPLIED_HPL	BIT(7)
+#define AIC32X4_GAIN_APPLIED_HPR	BIT(6)
+#define AIC32X4_OUTPWR_HPL		BIT(5)
+#define AIC32X4_OUTPWR_HPR		BIT(4)
 
 /* Read-only sequencing markers: final register values do not prove that
  * the analogue gain ramp saw the same clock/power sequence as 3.18. */
@@ -924,6 +1079,10 @@ static const struct snd_kcontrol_new aic32x4_diag_controls[] = {
 static const struct snd_kcontrol_new aic32x4_snd_controls[] = {
 	SOC_DOUBLE_R_S_TLV("PCM Playback Volume", AIC32X4_LDACVOL,
 			AIC32X4_RDACVOL, 0, -0x7f, 0x30, 7, 0, tlv_pcm),
+	SND_SOC_BYTES_EXT("DAC Biquad Coefficients", AIC32X4_BIQUAD_BYTES,
+			  aic32x4_biquads_get, aic32x4_biquads_put),
+	SOC_SINGLE_BOOL_EXT("DAC Mono Mix Switch", 0,
+			    aic32x4_dac_mix_get, aic32x4_dac_mix_put),
 	SOC_ENUM("DAC Left Playback PowerTune Switch", l_ptm_enum),
 	SOC_ENUM("DAC Right Playback PowerTune Switch", r_ptm_enum),
 	SOC_DOUBLE_R_S_TLV("HP Driver Gain Volume", AIC32X4_HPLGAIN,
@@ -1059,7 +1218,8 @@ static const struct snd_kcontrol_new in3l_to_rmixer_controls[] = {
 
 static const struct snd_soc_dapm_widget aic32x4_dapm_widgets[] = {
 	/* Both physical speaker bands belong to the single Playback stream. */
-	SND_SOC_DAPM_DAC("Left DAC", "Playback", AIC32X4_DACSETUP, 7, 0),
+	SND_SOC_DAPM_DAC_E("Left DAC", "Playback", AIC32X4_DACSETUP, 7, 0,
+			   aic32x4_dac_event, SND_SOC_DAPM_PRE_PMU),
 	SND_SOC_DAPM_MIXER("HPL Output Mixer", SND_SOC_NOPM, 0, 0,
 			   &hpl_output_mixer_controls[0],
 			   ARRAY_SIZE(hpl_output_mixer_controls)),
@@ -1070,7 +1230,8 @@ static const struct snd_soc_dapm_widget aic32x4_dapm_widgets[] = {
 			   ARRAY_SIZE(lol_output_mixer_controls)),
 	SND_SOC_DAPM_PGA("LOL Power", AIC32X4_OUTPWRCTL, 3, 0, NULL, 0),
 
-	SND_SOC_DAPM_DAC("Right DAC", "Playback", AIC32X4_DACSETUP, 6, 0),
+	SND_SOC_DAPM_DAC_E("Right DAC", "Playback", AIC32X4_DACSETUP, 6, 0,
+			   aic32x4_dac_event, SND_SOC_DAPM_PRE_PMU),
 	SND_SOC_DAPM_MIXER("HPR Output Mixer", SND_SOC_NOPM, 0, 0,
 			   &hpr_output_mixer_controls[0],
 			   ARRAY_SIZE(hpr_output_mixer_controls)),
@@ -1277,15 +1438,9 @@ EXPORT_SYMBOL(aic32x4_regmap_config);
 static int aic32x4_set_dai_sysclk(struct snd_soc_dai *codec_dai,
 				  int clk_id, unsigned int freq, int dir)
 {
-	struct snd_soc_component *component = codec_dai->component;
-	struct clk *mclk;
-	struct clk *pll;
-
-	pll = devm_clk_get(component->dev, "pll");
-	if (IS_ERR(pll))
-		return PTR_ERR(pll);
-
-	mclk = clk_get_parent(pll);
+	struct aic32x4_priv *aic32x4 =
+		snd_soc_component_get_drvdata(codec_dai->component);
+	struct clk *mclk = clk_get_parent(aic32x4->clks[AIC32X4_CLK_PLL].clk);
 
 	return clk_set_rate(mclk, freq);
 }
@@ -1412,28 +1567,28 @@ static int aic32x4_setup_puffin_48k_clocks(
 	 * Keep CCF as the sole owner.  The matching clock-provider special case
 	 * below makes the PLL rate request use the stock P=5/J=48/D=0 encoding.
 	 */
-	ret = clk_set_rate(clocks[0].clk, 92160000);
+	ret = clk_set_rate(clocks[AIC32X4_CLK_PLL].clk, 92160000);
 	if (ret)
 		return ret;
-	ret = clk_set_rate(clocks[1].clk, 18432000);
+	ret = clk_set_rate(clocks[AIC32X4_CLK_NADC].clk, 18432000);
 	if (ret)
 		return ret;
-	ret = clk_set_rate(clocks[2].clk, 6144000);
+	ret = clk_set_rate(clocks[AIC32X4_CLK_MADC].clk, 6144000);
 	if (ret)
 		return ret;
 	ret = aic32x4_set_aosr(component, 128);
 	if (ret)
 		return ret;
-	ret = clk_set_rate(clocks[3].clk, 18432000);
+	ret = clk_set_rate(clocks[AIC32X4_CLK_NDAC].clk, 18432000);
 	if (ret)
 		return ret;
-	ret = clk_set_rate(clocks[4].clk, 6144000);
+	ret = clk_set_rate(clocks[AIC32X4_CLK_MDAC].clk, 6144000);
 	if (ret)
 		return ret;
 	ret = aic32x4_set_dosr(component, 128);
 	if (ret)
 		return ret;
-	ret = clk_set_rate(clocks[5].clk, 6144000);
+	ret = clk_set_rate(clocks[AIC32X4_CLK_BDIV].clk, 6144000);
 	if (ret)
 		return ret;
 
@@ -1452,24 +1607,14 @@ static int aic32x4_setup_clocks(struct snd_soc_component *component,
 	u8 dosr_increment;
 	u16 max_dosr, min_dosr;
 	unsigned long adc_clock_rate, dac_clock_rate;
+	struct clk_bulk_data *clks = aic32x4->clks;
 	int ret;
 
-	static struct clk_bulk_data clocks[] = {
-		{ .id = "pll" },
-		{ .id = "nadc" },
-		{ .id = "madc" },
-		{ .id = "ndac" },
-		{ .id = "mdac" },
-		{ .id = "bdiv" },
-	};
-	ret = devm_clk_bulk_get(component->dev, ARRAY_SIZE(clocks), clocks);
-	if (ret)
-		return ret;
 	if (aic32x4->type == AIC32X4_TYPE_AIC32X4 &&
 	    sample_rate == AIC32X4_PUFFIN_SAMPLE_RATE &&
-	    clk_get_rate(clk_get_parent(clocks[0].clk)) ==
+	    clk_get_rate(clk_get_parent(clks[AIC32X4_CLK_PLL].clk)) ==
 						AIC32X4_PUFFIN_MCLK_RATE)
-		return aic32x4_setup_puffin_48k_clocks(component, clocks);
+		return aic32x4_setup_puffin_48k_clocks(component, clks);
 
 	if (sample_rate <= 48000) {
 		aosr = 128;
@@ -1537,19 +1682,20 @@ static int aic32x4_setup_clocks(struct snd_soc_component *component,
 					dac_clock_rate = ndac * mdac * dosr *
 							sample_rate;
 					if (dac_clock_rate == adc_clock_rate) {
-						if (clk_round_rate(clocks[0].clk, dac_clock_rate) == 0)
+						if (clk_round_rate(clks[AIC32X4_CLK_PLL].clk,
+								   dac_clock_rate) == 0)
 							continue;
 
-						ret = clk_set_rate(clocks[0].clk,
+						ret = clk_set_rate(clks[AIC32X4_CLK_PLL].clk,
 							   dac_clock_rate);
 						if (ret)
 							return ret;
 
-						ret = clk_set_rate(clocks[1].clk,
+						ret = clk_set_rate(clks[AIC32X4_CLK_NADC].clk,
 							   sample_rate * aosr * madc);
 						if (ret)
 							return ret;
-						ret = clk_set_rate(clocks[2].clk,
+						ret = clk_set_rate(clks[AIC32X4_CLK_MADC].clk,
 							   sample_rate * aosr);
 						if (ret)
 							return ret;
@@ -1557,11 +1703,11 @@ static int aic32x4_setup_clocks(struct snd_soc_component *component,
 						if (ret)
 							return ret;
 
-						ret = clk_set_rate(clocks[3].clk,
+						ret = clk_set_rate(clks[AIC32X4_CLK_NDAC].clk,
 							   sample_rate * dosr * mdac);
 						if (ret)
 							return ret;
-						ret = clk_set_rate(clocks[4].clk,
+						ret = clk_set_rate(clks[AIC32X4_CLK_MDAC].clk,
 							   sample_rate * dosr);
 						if (ret)
 							return ret;
@@ -1569,7 +1715,7 @@ static int aic32x4_setup_clocks(struct snd_soc_component *component,
 						if (ret)
 							return ret;
 
-						ret = clk_set_rate(clocks[5].clk,
+						ret = clk_set_rate(clks[AIC32X4_CLK_BDIV].clk,
 							   sample_rate * channels * bit_depth);
 						if (ret)
 							return ret;
@@ -1648,22 +1794,18 @@ static int aic32x4_hw_params(struct snd_pcm_substream *substream,
 	snd_soc_component_update_bits(component, AIC32X4_IFACE1,
 				AIC32X4_IFACE1_DATALEN_MASK, iface1_reg);
 
-	if (params_channels(params) == 1) {
-		aic32x4->playback_mono = true;
-		/*
-		 * Radar-Puffin is the stock MonoRight speaker path.  The
-		 * working 3.18 speaker codec feeds the right serial slot to
-		 * both DACs (0x24); feeding the left slot here leaves the
-		 * physical speaker path silent even though the PCM runs.
-		 */
-		dacsetup_reg = AIC32X4_RDAC2RCHN | AIC32X4_LDAC2RCHN;
-	} else {
-		aic32x4->playback_mono = false;
-		if (aic32x4->swapdacs)
-			dacsetup_reg = AIC32X4_RDAC2LCHN | AIC32X4_LDAC2RCHN;
-		else
-			dacsetup_reg = AIC32X4_LDAC2LCHN | AIC32X4_RDAC2RCHN;
-	}
+	aic32x4->dac_channels = params_channels(params);
+	aic32x4->playback_mono = aic32x4->dac_channels == 1;
+	/*
+	 * Mono is the stock MonoRight speaker path: feed the right serial
+	 * slot to both DACs (0x24), as the working 3.18 speaker codec does.
+	 * Feeding the left slot leaves the physical speaker path silent even
+	 * though the PCM runs.  Lidar inverts that wiring and sets
+	 * libreecho,mono-left, so it gets the left slot instead.
+	 * aic32x4_dac_chan() applies the dac_mix switch only to stereo
+	 * streams; mono returns before it is consulted.
+	 */
+	dacsetup_reg = aic32x4_dac_chan(aic32x4);
 	snd_soc_component_update_bits(component, AIC32X4_DACSETUP,
 				AIC32X4_DAC_CHAN_MASK, dacsetup_reg);
 	dev_info(component->dev,
@@ -1696,6 +1838,7 @@ static int aic32x4_apply_playback_mute(struct snd_soc_component *component,
 	unsigned int gain_ready_mask;
 	unsigned int unmute_state;
 	unsigned int retry = 0;
+	int outpwr;
 	int status;
 	int ret;
 
@@ -1724,15 +1867,32 @@ static int aic32x4_apply_playback_mute(struct snd_soc_component *component,
 
 	if (aic32x4->playback_mono) {
 		unmute_state |= AIC32X4_UNMUTE_MONO;
-		gain_ready_mask = AIC32X4_GAIN_APPLIED_MONO;
+		gain_ready_mask = AIC32X4_GAIN_APPLIED_HPR;
 	} else {
-		gain_ready_mask = AIC32X4_GAIN_APPLIED_STEREO;
+		gain_ready_mask = AIC32X4_GAIN_APPLIED_HPL |
+				  AIC32X4_GAIN_APPLIED_HPR;
 	}
+
+	/*
+	 * The wait lets the headphone gain ramp (P1_R20) settle before the
+	 * DAC is unmuted.  A flag of a powered-down driver (P1_R9) never
+	 * sets: a board that plays through the line outputs only reads
+	 * P1_R63 as 0 and would hold every stream start muted for the full
+	 * timeout.  Wait only on the flags of powered headphone drivers.
+	 */
+	outpwr = snd_soc_component_read(component, AIC32X4_OUTPWRCTL);
+	if (outpwr < 0)
+		return aic32x4_playback_fail_closed(component, outpwr);
+	if (!(outpwr & AIC32X4_OUTPWR_HPL))
+		gain_ready_mask &= ~AIC32X4_GAIN_APPLIED_HPL;
+	if (!(outpwr & AIC32X4_OUTPWR_HPR))
+		gain_ready_mask &= ~AIC32X4_GAIN_APPLIED_HPR;
 
 	status = snd_soc_component_read(component, AIC32X4_GAIN_APPLIED);
 	if (status < 0)
 		return aic32x4_playback_fail_closed(component, status);
-	while ((status & gain_ready_mask) != gain_ready_mask &&
+	while (gain_ready_mask &&
+	       (status & gain_ready_mask) != gain_ready_mask &&
 	       retry < AIC32X4_GAIN_APPLIED_RETRIES) {
 		msleep(AIC32X4_GAIN_APPLIED_POLL_MS);
 		status = snd_soc_component_read(component, AIC32X4_GAIN_APPLIED);
@@ -1740,10 +1900,10 @@ static int aic32x4_apply_playback_mute(struct snd_soc_component *component,
 			return aic32x4_playback_fail_closed(component, status);
 		retry++;
 	}
-	if ((status & gain_ready_mask) != gain_ready_mask)
+	if (gain_ready_mask && (status & gain_ready_mask) != gain_ready_mask)
 		dev_warn(component->dev,
-			 "DAC gain-applied timeout (state=%x mask=%x); continuing unmute\n",
-			 status, gain_ready_mask);
+			 "headphone gain-applied timeout (state=%x mask=%x) after %u polls; continuing unmute\n",
+			 status, gain_ready_mask, retry);
 
 	/* The mono codec state is 0x08, as in the working 3.18 driver. */
 	ret = snd_soc_component_write(component, AIC32X4_DACMUTE,
@@ -1785,22 +1945,15 @@ static int aic32x4_mute(struct snd_soc_dai *dai, int mute, int direction)
 static int aic32x4_set_bias_level(struct snd_soc_component *component,
 				  enum snd_soc_bias_level level)
 {
+	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
+	struct clk_bulk_data *clks = &aic32x4->clks[AIC32X4_CLK_MADC];
 	int ret;
 
-	static struct clk_bulk_data clocks[] = {
-		{ .id = "madc" },
-		{ .id = "mdac" },
-		{ .id = "bdiv" },
-	};
-
-	ret = devm_clk_bulk_get(component->dev, ARRAY_SIZE(clocks), clocks);
-	if (ret)
-		return ret;
 	aic32x4_log_playback_state(component, "bias-enter");
-
 	switch (level) {
 	case SND_SOC_BIAS_ON:
-		ret = clk_bulk_prepare_enable(ARRAY_SIZE(clocks), clocks);
+		ret = clk_bulk_prepare_enable(AIC32X4_NUM_BIAS_CLKS, clks);
 		if (ret) {
 			dev_err(component->dev, "Failed to enable clocks\n");
 			return ret;
@@ -1810,9 +1963,10 @@ static int aic32x4_set_bias_level(struct snd_soc_component *component,
 		break;
 	case SND_SOC_BIAS_STANDBY:
 		/* CCF owns both divider rate fields and enable bits. */
-		if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_OFF)
+		if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_OFF)
 			break;
-		clk_bulk_disable_unprepare(ARRAY_SIZE(clocks), clocks);
+
+		clk_bulk_disable_unprepare(AIC32X4_NUM_BIAS_CLKS, clks);
 		break;
 	case SND_SOC_BIAS_OFF:
 		break;
@@ -1929,6 +2083,44 @@ static void aic32x4_setup_gpios(struct snd_soc_component *component)
 	}
 }
 
+/* The codec's clocks are taken once per component, see aic32x4_priv. */
+static int aic32x4_get_clocks(struct snd_soc_component *component)
+{
+	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
+	static const char * const ids[AIC32X4_NUM_CLKS] = {
+		[AIC32X4_CLK_CODEC_CLKIN] = "codec_clkin",
+		[AIC32X4_CLK_PLL] = "pll",
+		[AIC32X4_CLK_NADC] = "nadc",
+		[AIC32X4_CLK_NDAC] = "ndac",
+		[AIC32X4_CLK_MADC] = "madc",
+		[AIC32X4_CLK_MDAC] = "mdac",
+		[AIC32X4_CLK_BDIV] = "bdiv",
+	};
+	int i, ret;
+
+	for (i = 0; i < AIC32X4_NUM_CLKS; i++)
+		aic32x4->clks[i].id = ids[i];
+
+	ret = clk_bulk_get(component->dev, AIC32X4_NUM_CLKS, aic32x4->clks);
+	if (ret)
+		return ret;
+
+	clk_set_parent(aic32x4->clks[AIC32X4_CLK_CODEC_CLKIN].clk,
+		       aic32x4->clks[AIC32X4_CLK_PLL].clk);
+	clk_set_parent(aic32x4->clks[AIC32X4_CLK_BDIV].clk,
+		       aic32x4->clks[AIC32X4_CLK_MDAC].clk);
+
+	return 0;
+}
+
+static void aic32x4_component_remove(struct snd_soc_component *component)
+{
+	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
+
+	clk_bulk_put(AIC32X4_NUM_CLKS, aic32x4->clks);
+	aic32x4->component = NULL;
+}
+
 static int aic32x4_component_probe(struct snd_soc_component *component)
 {
 	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
@@ -1937,22 +2129,12 @@ static int aic32x4_component_probe(struct snd_soc_component *component)
 
 	aic32x4->component = component;
 
-	static struct clk_bulk_data clocks[] = {
-		{ .id = "codec_clkin" },
-		{ .id = "pll" },
-		{ .id = "bdiv" },
-		{ .id = "mdac" },
-	};
-
-	ret = devm_clk_bulk_get(component->dev, ARRAY_SIZE(clocks), clocks);
+	ret = aic32x4_get_clocks(component);
 	if (ret)
 		return ret;
 
 	if (aic32x4->setup)
 		aic32x4_setup_gpios(component);
-
-	clk_set_parent(clocks[0].clk, clocks[1].clk);
-	clk_set_parent(clocks[2].clk, clocks[3].clk);
 
 	/*
 	 * Match the working Puffin 3.18 bootstrap: feed the speaker
@@ -2071,13 +2253,6 @@ static int aic32x4_of_xlate_dai_id(struct snd_soc_component *component,
 
 }
 
-static void aic32x4_component_remove(struct snd_soc_component *component)
-{
-	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
-
-	aic32x4->component = NULL;
-}
-
 static const struct snd_soc_component_driver soc_component_dev_aic32x4 = {
 	.probe			= aic32x4_component_probe,
 	.remove			= aic32x4_component_remove,
@@ -2158,22 +2333,12 @@ static int aic32x4_tas2505_component_probe(struct snd_soc_component *component)
 	u32 tmp_reg;
 	int ret;
 
-	static struct clk_bulk_data clocks[] = {
-		{ .id = "codec_clkin" },
-		{ .id = "pll" },
-		{ .id = "bdiv" },
-		{ .id = "mdac" },
-	};
-
-	ret = devm_clk_bulk_get(component->dev, ARRAY_SIZE(clocks), clocks);
+	ret = aic32x4_get_clocks(component);
 	if (ret)
 		return ret;
 
 	if (aic32x4->setup)
 		aic32x4_setup_gpios(component);
-
-	clk_set_parent(clocks[0].clk, clocks[1].clk);
-	clk_set_parent(clocks[2].clk, clocks[3].clk);
 
 	/* Power platform configuration */
 	if (aic32x4->power_cfg & AIC32X4_PWR_AVDD_DVDD_WEAK_DISABLE)
@@ -2260,6 +2425,12 @@ static int aic32x4_parse_dt(struct aic32x4_priv *aic32x4,
 	if (of_property_read_u32_array(np, "aic32x4-gpio-func",
 				aic32x4_setup->gpio_func, 5) >= 0)
 		aic32x4->setup = aic32x4_setup;
+	/*
+	 * The board wires its mono speaker to the left serial slot, so mono
+	 * playback must feed that slot to both DACs.  Boards with the stock
+	 * right-slot MonoRight wiring leave this unset, which is the default.
+	 */
+	aic32x4->mono_left = of_property_read_bool(np, "libreecho,mono-left");
 	return 0;
 }
 
@@ -2381,6 +2552,13 @@ int aic32x4_probe(struct device *dev, struct regmap *regmap,
 	aic32x4->defer_playback_unmute =
 		aic32x4->type == AIC32X4_TYPE_AIC32X4;
 	mutex_init(&aic32x4->diag_lock);
+	aic32x4->dac_channels = 2;
+	/* Pass-through biquads (N0 = 0x7fffff), the codec's reset values */
+	for (int i = 0; i < 2 * AIC32X4_BIQUAD_COEFS; i += 5) {
+		aic32x4->dac_biquads[3 * i] = 0x7f;
+		aic32x4->dac_biquads[3 * i + 1] = 0xff;
+		aic32x4->dac_biquads[3 * i + 2] = 0xff;
+	}
 
 	dev_set_drvdata(dev, aic32x4);
 

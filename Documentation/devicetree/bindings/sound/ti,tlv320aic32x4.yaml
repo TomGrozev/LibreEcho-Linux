@@ -57,6 +57,13 @@ properties:
     minItems: 5
     maxItems: 5
 
+  libreecho,mono-left:
+    description: |
+      The board wires its mono speaker to the left serial slot. When set,
+      mono playback feeds the left slot to both DACs instead of the
+      default right slot.
+    type: boolean
+
 required:
   - compatible
   - reg

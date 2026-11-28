@@ -190,6 +190,16 @@ int aic32x4_register_clocks(struct device *dev, const char *mclk_name);
 #define AIC32X4_RDAC2LCHN		BIT(3)
 #define AIC32X4_RDAC2RCHN		BIT(2)
 
+/*
+ * DAC biquads A-C (processing blocks 1, 9 and 19): 15 coefficients
+ * per channel, each a 24 bit two's complement value (MSB first) in the first
+ * three of four consecutive registers.
+ */
+#define AIC32X4_LDAC_BIQUAD_A		AIC32X4_REG(44, 12)
+#define AIC32X4_RDAC_BIQUAD_A		AIC32X4_REG(45, 20)
+#define AIC32X4_BIQUAD_COEFS		15
+#define AIC32X4_BIQUAD_BYTES		(2 * AIC32X4_BIQUAD_COEFS * 3)
+
 /* AIC32X4_DACMUTE */
 #define AIC32X4_MUTEON			0x0C
 #define AIC32X4_UNMUTE_MONO		0x08

@@ -46,6 +46,10 @@ struct is31fl32xx_priv {
 	const struct is31fl32xx_chipdef *cdef;
 	struct i2c_client *client;
 	unsigned int num_leds;
+	/*
+	 * LibreEcho renders the 12 RGB pixels of the light ring atomically
+	 * through the frame/scaled_frame attributes; see is31fl3236_update_frame().
+	 */
 	struct mutex frame_lock;
 	u8 channel_offset;
 	u8 frame[36];
@@ -388,6 +392,11 @@ static int is31fl32xx_init_regs(struct is31fl32xx_priv *priv)
 #define IS31FL3236_CTRL_SL_SHIFT	1
 #define IS31FL3236_SCALE_MAX		3
 
+static bool is31fl3236_family(const struct is31fl32xx_chipdef *cdef)
+{
+	return cdef == &is31fl3236_cdef || cdef == &is31fl3236a_cdef;
+}
+
 static int is31fl3236_update_frame(struct is31fl32xx_priv *priv,
 				   const u8 *frame, const u8 *scale)
 {
@@ -674,7 +683,7 @@ static int is31fl32xx_probe(struct i2c_client *client)
 	cdef = device_get_match_data(dev);
 
 	count = of_get_available_child_count(dev_of_node(dev));
-	if (!count && cdef != &is31fl3236_cdef)
+	if (!count && !is31fl3236_family(cdef))
 		return -EINVAL;
 
 	priv = devm_kzalloc(dev, struct_size(priv, leds, count),
@@ -685,7 +694,7 @@ static int is31fl32xx_probe(struct i2c_client *client)
 	priv->client = client;
 	priv->cdef = cdef;
 	mutex_init(&priv->frame_lock);
-	if (cdef == &is31fl3236_cdef) {
+	if (is31fl3236_family(cdef)) {
 		of_property_read_u8(dev_of_node(dev), "channel-offset",
 				    &priv->channel_offset);
 		priv->channel_offset %= ARRAY_SIZE(priv->frame);
@@ -703,7 +712,7 @@ static int is31fl32xx_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
-	if (cdef == &is31fl3236_cdef) {
+	if (is31fl3236_family(cdef)) {
 		ret = devm_device_add_group(dev, &is31fl3236_attr_group);
 		if (ret)
 			return ret;

@@ -76,7 +76,7 @@ class Mt8163PstoreRamoopsContractTests(unittest.TestCase):
             runner.count('"tools/mt8163_pstore_ramoops_contract_test.py"'), 1
         )
         self.assertIn("python3 -B libreecho/run_contract_tests.py", self.workflow)
-        self.assertIn("name: ARM32 kernel build and regression checks", self.workflow)
+        self.assertIn("name: Kernel build and regression checks", self.workflow)
 
 
 if __name__ == "__main__":
