@@ -211,8 +211,14 @@ static int aic32x4_dac_mix_put(struct snd_kcontrol *kcontrol,
 #define AIC32X4_GAIN_APPLIED		AIC32X4_REG(1, 63)
 #define AIC32X4_GAIN_APPLIED_POLL_MS	100
 #define AIC32X4_GAIN_APPLIED_RETRIES	22
-#define AIC32X4_GAIN_APPLIED_MONO	BIT(6)
-#define AIC32X4_GAIN_APPLIED_STEREO	(BIT(7) | BIT(6))
+/*
+ * P1_R63 gain flags follow the P1_R9 output-driver bits (SLAA557 5.3.7,
+ * 5.3.37).  Only the headphone drivers have a startup ramp (P1_R20).
+ */
+#define AIC32X4_GAIN_APPLIED_HPL	BIT(7)
+#define AIC32X4_GAIN_APPLIED_HPR	BIT(6)
+#define AIC32X4_OUTPWR_HPL		BIT(5)
+#define AIC32X4_OUTPWR_HPR		BIT(4)
 
 /* Read-only sequencing markers: final register values do not prove that
  * the analogue gain ramp saw the same clock/power sequence as 3.18. */
@@ -1832,6 +1838,7 @@ static int aic32x4_apply_playback_mute(struct snd_soc_component *component,
 	unsigned int gain_ready_mask;
 	unsigned int unmute_state;
 	unsigned int retry = 0;
+	int outpwr;
 	int status;
 	int ret;
 
@@ -1860,15 +1867,32 @@ static int aic32x4_apply_playback_mute(struct snd_soc_component *component,
 
 	if (aic32x4->playback_mono) {
 		unmute_state |= AIC32X4_UNMUTE_MONO;
-		gain_ready_mask = AIC32X4_GAIN_APPLIED_MONO;
+		gain_ready_mask = AIC32X4_GAIN_APPLIED_HPR;
 	} else {
-		gain_ready_mask = AIC32X4_GAIN_APPLIED_STEREO;
+		gain_ready_mask = AIC32X4_GAIN_APPLIED_HPL |
+				  AIC32X4_GAIN_APPLIED_HPR;
 	}
+
+	/*
+	 * The wait lets the headphone gain ramp (P1_R20) settle before the
+	 * DAC is unmuted.  A flag of a powered-down driver (P1_R9) never
+	 * sets: a board that plays through the line outputs only reads
+	 * P1_R63 as 0 and would hold every stream start muted for the full
+	 * timeout.  Wait only on the flags of powered headphone drivers.
+	 */
+	outpwr = snd_soc_component_read(component, AIC32X4_OUTPWRCTL);
+	if (outpwr < 0)
+		return aic32x4_playback_fail_closed(component, outpwr);
+	if (!(outpwr & AIC32X4_OUTPWR_HPL))
+		gain_ready_mask &= ~AIC32X4_GAIN_APPLIED_HPL;
+	if (!(outpwr & AIC32X4_OUTPWR_HPR))
+		gain_ready_mask &= ~AIC32X4_GAIN_APPLIED_HPR;
 
 	status = snd_soc_component_read(component, AIC32X4_GAIN_APPLIED);
 	if (status < 0)
 		return aic32x4_playback_fail_closed(component, status);
-	while ((status & gain_ready_mask) != gain_ready_mask &&
+	while (gain_ready_mask &&
+	       (status & gain_ready_mask) != gain_ready_mask &&
 	       retry < AIC32X4_GAIN_APPLIED_RETRIES) {
 		msleep(AIC32X4_GAIN_APPLIED_POLL_MS);
 		status = snd_soc_component_read(component, AIC32X4_GAIN_APPLIED);
@@ -1876,10 +1900,10 @@ static int aic32x4_apply_playback_mute(struct snd_soc_component *component,
 			return aic32x4_playback_fail_closed(component, status);
 		retry++;
 	}
-	if ((status & gain_ready_mask) != gain_ready_mask)
+	if (gain_ready_mask && (status & gain_ready_mask) != gain_ready_mask)
 		dev_warn(component->dev,
-			 "DAC gain-applied timeout (state=%x mask=%x); continuing unmute\n",
-			 status, gain_ready_mask);
+			 "headphone gain-applied timeout (state=%x mask=%x) after %u polls; continuing unmute\n",
+			 status, gain_ready_mask, retry);
 
 	/* The mono codec state is 0x08, as in the working 3.18 driver. */
 	ret = snd_soc_component_write(component, AIC32X4_DACMUTE,
